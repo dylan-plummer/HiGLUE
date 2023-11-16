@@ -41,7 +41,7 @@ if __name__ == '__main__':
     rna_file = args.rna_file
     loop_q = args.loop_q
     load_rna = False
-    load_hic = True
+    load_hic = False
     use_toploops = False 
     use_ice = args.use_ice
     use_2d_rep = False
@@ -118,6 +118,8 @@ if __name__ == '__main__':
         if 'batch' not in rna.obs.columns:
             rna.obs['batch'] = 0
         rna.layers["counts"] = rna.X.copy()
+        # reset rna vars
+        rna.var = pd.DataFrame(index=rna.var_names)
         try:
             rna.var.drop(columns=['chrom'], inplace=True)
             rna.var.drop(columns=['chromStart'], inplace=True)
@@ -141,7 +143,7 @@ if __name__ == '__main__':
         rna.var['chromStart'] = rna.var['chromStart'].fillna(0).astype(int)
         rna.var['chromEnd'] = rna.var['chromEnd'].fillna(0).astype(int)
         rna.var['strand'] = rna.var['strand'].fillna('+')
-        rna.var['chrom'] = rna.var['chrom']
+        rna.var['chrom'] = 'chr' + rna.var['chrom']
         rna = rna[:, rna.var['chrom'].notna()].copy()
         rna.write(f"{out_dir}/rna/{base_rna_filename}", compression="gzip")
     else:
@@ -213,6 +215,8 @@ if __name__ == '__main__':
         hic.write(base_hic_path, compression="gzip")
     else:
         hic = ad.read_h5ad(base_hic_path)
+    print(hic)
+    print(hic.var_names[:10])
     print('Embedding Hi-C data...')
     sc.pp.filter_genes(hic, min_counts=3)
     sc.pp.normalize_per_cell(hic, counts_per_cell_after=1e5)
@@ -222,7 +226,7 @@ if __name__ == '__main__':
     fig = sc.pl.umap(hic, color=["celltype", "batch"], return_fig=True)
     fig.savefig(f'{plot_dir}/pfc_hic_umap_{resolution}.png')
     plt.close()
-
+    
     genes = scglue.genomics.Bed(rna.var.assign(name=rna.var_names))
     peaks = scglue.genomics.Bed(hic.var.assign(name=hic.var_names))
     tss = genes.strand_specific_start_site()
