@@ -36,8 +36,8 @@ if __name__ == '__main__':
     
 
     n_strata = args.n_strata
-    resolution = '100kb'
-    loop_q = 0.99
+    resolution = args.resolution
+    loop_q = args.loop_q
     load_rna = False
     load_hic = True
     use_toploops = False 
