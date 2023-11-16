@@ -109,6 +109,7 @@ if __name__ == '__main__':
         base_rna_filename = 'rna_base.h5ad'
     if  base_rna_filename not in os.listdir(os.path.join(out_dir, 'rna')) or not load_rna:
         rna = ad.read_h5ad(rna_file)
+        print(rna)
         try:
             rna.X = rna.layers["counts"]
         except Exception as e:
@@ -117,12 +118,26 @@ if __name__ == '__main__':
         if 'batch' not in rna.obs.columns:
             rna.obs['batch'] = 0
         rna.layers["counts"] = rna.X.copy()
-        scglue.data.get_gene_annotation(
-            rna, gtf=gtf_file,
-            gtf_by="gene_symbol"
-        )
+        try:
+            rna.var.drop(columns=['chrom'], inplace=True)
+            rna.var.drop(columns=['chromStart'], inplace=True)
+            rna.var.drop(columns=['chromEnd'], inplace=True)
+            rna.var.drop(columns=['strand'], inplace=True)
+        except Exception as e:
+            print(e)
+            pass
+        try:
+            scglue.data.get_gene_annotation(
+                rna, gtf=gtf_file,
+                gtf_by="gene_name"
+            )
+        except KeyError:
+            scglue.data.get_gene_annotation(
+                rna, gtf=gtf_file,
+                gtf_by="gene_symbol"
+            )
+            
         
-
         rna.var['chromStart'] = rna.var['chromStart'].fillna(0).astype(int)
         rna.var['chromEnd'] = rna.var['chromEnd'].fillna(0).astype(int)
         rna.var['strand'] = rna.var['strand'].fillna('+')
