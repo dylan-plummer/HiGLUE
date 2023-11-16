@@ -37,6 +37,8 @@ if __name__ == '__main__':
 
     n_strata = args.n_strata
     resolution = args.resolution
+    gtf_file = args.gtf
+    rna_file = args.rna_file
     loop_q = args.loop_q
     load_rna = False
     load_hic = True
@@ -106,7 +108,7 @@ if __name__ == '__main__':
     else:
         base_rna_filename = 'rna_base.h5ad'
     if  base_rna_filename not in os.listdir(os.path.join(out_dir, 'rna')) or not load_rna:
-        rna = ad.read_h5ad(args.rna_file)
+        rna = ad.read_h5ad(rna_file)
         try:
             rna.X = rna.layers["counts"]
         except Exception as e:
@@ -116,7 +118,7 @@ if __name__ == '__main__':
             rna.obs['batch'] = 0
         rna.layers["counts"] = rna.X.copy()
         scglue.data.get_gene_annotation(
-            rna, gtf=args.gtf,
+            rna, gtf=gtf_file,
             gtf_by="gene_symbol"
         )
         
