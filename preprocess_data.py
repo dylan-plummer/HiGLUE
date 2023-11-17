@@ -426,7 +426,6 @@ if __name__ == '__main__':
     nx.set_node_attributes(pchic_graph, chrom_attr, "chrom")
     nx.set_node_attributes(pchic_graph, pos_attr, "chrom_pos")
     nx.set_node_attributes(pchic_graph, type_attr, "feature_type")
-    nx.set_node_attributes(pchic_graph, strata_attr, "strata")
     nx.write_graphml(pchic_graph, f"{out_dir}/graphs/hic_{resolution}_{suffix}.graphml.gz")
 
     nx.write_graphml(o_prior, f"{out_dir}/graphs/o_prior_{resolution}_{suffix}.graphml.gz", named_key_ids=True)
@@ -434,5 +433,4 @@ if __name__ == '__main__':
     nx.set_node_attributes(dcq_prior, chrom_attr, "chrom")
     nx.set_node_attributes(dcq_prior, pos_attr, "chrom_pos")
     nx.set_node_attributes(dcq_prior, type_attr, "feature_type")
-    nx.set_node_attributes(dcq_prior, strata_attr, "strata")
     nx.write_graphml(dcq_prior, f"{out_dir}/graphs/dcq_prior_{resolution}_{suffix}.graphml.gz", edge_id_from_attribute='edge_id', named_key_ids=True)
