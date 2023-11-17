@@ -22,7 +22,7 @@ if __name__ == '__main__':
     parser.add_argument('--hic_file', type=str)
     parser.add_argument('--graph_file', type=str)
     parser.add_argument('--prior', type=str, default='dcq')
-    parser.add_argument('--dset', '--dataset_name', type=str)
+    parser.add_argument('--dset', '--dataset_name', type=str, default='islet')
     parser.add_argument('--wandb', action='store_true')
     parser.add_argument('--hic_dist', type=str, default='NB')
     parser.add_argument('--n_neighbors', type=int, default=10)
@@ -78,7 +78,7 @@ if __name__ == '__main__':
         for i, row in dx.iterrows():
             wandb.log({"n_meta": row['n_meta'], "consistency": row['consistency']})
     sns.lineplot(x="n_meta", y="consistency", data=dx).axhline(y=0.05, c="darkred", ls="--")
-    plt.savefig(f'{args.dset}_consistency.png')
+    plt.savefig('consistency.png')
     plt.close()
 
     # embed and visualize
