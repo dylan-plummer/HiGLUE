@@ -1,3 +1,17 @@
+tutorials/data
+tutorials/pfc_neurons_data
+tutorials/pfc_neurons_plots
+tutorials/scools
+
+figure_notebooks/ism_figs
+figure_notebooks/ism_figs_pfc
+figure_notebooks/islet_ism_figs
+figure_notebooks/islet_embeddings
+figure_notebooks/human_brain_embeddings
+
+wandb/*
+tmp_imgs/*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
