@@ -14,6 +14,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from multiprocessing import Pool
 
 from tqdm import tqdm
 from scipy.linalg import block_diag
@@ -117,7 +118,7 @@ def get_flattened_matrices(dataset, n_strata, preprocessing=None, agg_fn=None, c
 
 
 
-def preprocess_higlue(args):
+def preprocess_higlue(args, glue_args):
     n_strata = args.n_strata
     resolution = args.resolution
     gtf_file = args.gtf
@@ -462,9 +463,15 @@ def preprocess_higlue(args):
         strata_adatas = []
         total_interactions = 0
         print(f'Processing strata...')
+        #visibility_mat = dataset.write_cell_bin_matrix()
         for k in range(abs(loops_offset), n_strata + abs(loops_offset)):
             strata_mat = []
             for cell_i, cell in enumerate(sorted(dataset.cell_list)):
+                # TODO: maybe diagonal should be cis visibility?
+                # if k == 0:
+                #     new_strata = visibility_mat[cell_i]
+                #     strata_mat.append(new_strata)
+                # else:
                 new_strata = list(mats[cell_i].diagonal(k=k))
                 if len(new_strata) < len(frags):
                     new_strata += [0] * (len(frags) - len(new_strata))
