@@ -78,6 +78,8 @@ if __name__ == '__main__':
     glue_parser.add_argument('--shifted_additive', action='store_true')
     glue_parser.add_argument('--use_activation', action='store_true')
     glue_parser.add_argument('--use_attn', action='store_true')
+    glue_parser.add_argument('--use_batch', type=str, default=None)
+    glue_parser.add_argument('--cache_checkpoint', type=str, default=None)
 
     glue_args = sys.argv.index('SCORE')
     args = glue_parser.parse_args(sys.argv[1:glue_args] + sys.argv[glue_args + 1:])
@@ -121,7 +123,8 @@ if __name__ == '__main__':
     use_attn = args.use_attn
     use_wandb = True
     use_rna_pca = True
-    use_batch = None
+    use_batch = args.use_batch
+    cache_checkpoint = args.cache_checkpoint
     min_confidence = 0.4
 
     if args.preprocess:
@@ -133,6 +136,8 @@ if __name__ == '__main__':
         rna = ad.read_h5ad(f"{out_dir}/rna/rna_{full_file_suffix}.h5ad")
         
         hic = ad.read_h5ad(f"{out_dir}/hic/hic_{full_file_suffix}.h5ad")
+        hic.obs.loc[hic.obs_names.str.startswith('alpha_'), 'celltype'] = 'Alpha'
+        hic.obs.loc[hic.obs_names.str.startswith('beta_'), 'celltype'] = 'Beta'
 
         rna.var["highly_variable"] = rna.var["highly_variable"] & rna.var["in_hic"]
         hic.var["highly_variable"] = True
@@ -265,7 +270,10 @@ if __name__ == '__main__':
                     "wait_n_lrs": 2}
         )
 
-        glue.save(f"{out_dir}/glue_hic_{prior_name}_prior_{resolution}_pfc.dill")
+        glue.save(f"{out_dir}/glue_hic_{prior_name}_prior_{resolution}_{n_genes}_{n_strata}.dill")
+        if cache_checkpoint:
+            n_checkpoints = len(os.listdir(cache_checkpoint))
+            glue.save(f"{cache_checkpoint}/glue_hic_{prior_name}_prior_{resolution}_{n_checkpoints}.dill")
         # embed and visualize
         rna.obsm["X_glue"] = glue.encode_data("rna", rna)
         hic.obsm["X_glue"] = glue.encode_data("hic", hic)
@@ -278,6 +286,10 @@ if __name__ == '__main__':
         # run leiden clustering to identify clusters
         sc.pp.neighbors(hic, use_rep="X_glue", metric="cosine")
         sc.tl.leiden(hic)
+
+        sc.pp.neighbors(rna, use_rep="X_glue", metric="cosine")
+        sc.tl.leiden(rna)
+
         # transfer labels to predict celltypes
         scglue.data.transfer_labels(rna, hic, "celltype", use_rep="X_glue", n_neighbors=n_neighbors)
         try:
@@ -295,6 +307,20 @@ if __name__ == '__main__':
                 wandb.log({"accuracy": accuracy, 
                         "ari": ari_leiden,
                         "ari_label_transfer": ari})
+
+            # also do the same for RNA
+            rna_celltypes = rna.obs['celltype'].unique()
+            print(rna_celltypes)
+            rna_celltype_map = {c: i for i, c in enumerate(rna_celltypes)}
+            print(rna_celltype_map)
+            rna.obs['old_celltype_int'] = rna.obs['old_celltype'].map(rna_celltype_map)
+            #rna.obs['celltype_int'] = rna.obs['leiden'].map(rna_celltype_map)
+            #rna.obs['celltype_int'].fillna(len(rna_celltypes), inplace=True)
+            rna_accuracy = accuracy_score(rna.obs['old_celltype_int'], rna.obs['leiden'])
+            rna_ari = adjusted_rand_score(rna.obs['old_celltype_int'], rna.obs['leiden'])
+            if use_wandb:
+                wandb.log({"rna_accuracy": rna_accuracy, 
+                        "rna_ari": rna_ari})
 
             # remove low confidence cells
             hic = hic[hic.obs['celltype_confidence'] > min_confidence, :].copy()
@@ -365,6 +391,28 @@ if __name__ == '__main__':
         os.makedirs(f"{out_dir}/combined_embedding", exist_ok=True)
         combined.write(f"{out_dir}/combined_embedding/combined_{full_file_suffix}.h5ad", compression="gzip")
 
+        if 'islet' in dataset_name:
+            sorted_hic = hic[hic.obs_names.str.startswith('alpha_') | hic.obs_names.str.startswith('beta_')]
+            sorted_rna = rna[rna.obs['celltype'].isin(['Alpha', 'Beta'])]
+            sorted_hic.obs['sorted_celltype'] = sorted_hic.obs['celltype']
+            celltypes = sorted(sorted_hic.obs['celltype'].unique())
+            celltype_map = {c: i for i, c in enumerate(celltypes)}
+            sorted_hic.obs['celltype_int'] = sorted_hic.obs['celltype'].map(celltype_map)
+            scglue.data.transfer_labels(sorted_rna, sorted_hic, "celltype", use_rep="X_glue", n_neighbors=5, key_added="pred_celltype_sorted")
+            sorted_hic.obs['pred_celltype_int'] = sorted_hic.obs['pred_celltype_sorted'].map(celltype_map)
+            # measure accuracy
+            val_accuracy = accuracy_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
+            val_ari = adjusted_rand_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
+            if use_wandb:
+                wandb.log({"val_accuracy": val_accuracy, "val_ari": val_ari})
+
+            confident_filtered_hic = sorted_hic[sorted_hic.obs['celltype_confidence'] > min_confidence, :].copy()
+            confident_filtered_hic = confident_filtered_hic[confident_filtered_hic.obs['depth'] > min_depth, :]
+            # measure accuracy
+            val_accuracy = accuracy_score(confident_filtered_hic.obs['celltype_int'], confident_filtered_hic.obs['pred_celltype_int'])
+            val_ari = adjusted_rand_score(confident_filtered_hic.obs['celltype_int'], confident_filtered_hic.obs['pred_celltype_int'])
+            if use_wandb:
+                wandb.log({"val_accuracy_filtered": val_accuracy, "val_ari_filtered": val_ari})
 
         if use_wandb:
             wandb.finish()
