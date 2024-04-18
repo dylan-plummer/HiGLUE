@@ -3,9 +3,16 @@ Joint generative modeling of single-cell Hi-C with other single-cell modalities 
 
 HiGLUE depends on the following packages: 
 
-* `scloop`: https://github.com/dylan-plummer/scloop
+* `SCORE`: https://github.com/JinLabBioinfo/SCORE.git
 
-* `scglue`: https://scglue.readthedocs.io/en/latest/
+* `scglue`: https://scglue.readthedocs.io/en/latest/ (note that HiGLUE currently needs a custom fork of `scglue`)
+
+To install these packages for HiGLUE, you can run the following:
+
+`pip install git+https://github.com/JinLabBioinfo/SCORE.git`
+
+`pip install git+https://github.com/dylan-plummer/GLUE.git`
+
 
 After installing the above packages, you need to generate the 3 input files for training HiGLUE:
 

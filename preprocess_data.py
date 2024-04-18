@@ -192,7 +192,6 @@ def preprocess_higlue(args, glue_args):
 
     if use_compartment_signs:
         bins = bulk.bins()[:]
-        print(bins)
         if 'weight' not in bins.columns:
             set_verbosity_level(1)
             cooler.balance_cooler(bulk, cis_only=True, store=True)
@@ -308,7 +307,6 @@ def preprocess_higlue(args, glue_args):
     #     diag = pd.DataFrame({'bin1_id': a1, 'bin2_id': a2, 'count': 1, 'rank': 1.0})
     #     loops = pd.concat([loops, diag], ignore_index=True)
     print(loops)
-    print(frags)
 
     frags.rename(columns={'start': 'chromStart', 'end': 'chromEnd'}, inplace=True)
 
@@ -318,7 +316,6 @@ def preprocess_higlue(args, glue_args):
         base_rna_filename = 'rna_base.h5ad'
     if  base_rna_filename not in os.listdir(os.path.join(out_dir, 'rna')) or not load_rna:
         rna = ad.read_h5ad(rna_file)
-        print(rna)
         try:
             rna.X = rna.layers["counts"]
         except Exception as e:
@@ -346,7 +343,6 @@ def preprocess_higlue(args, glue_args):
                 except Exception as e:
                     pass
             try:
-                print(np.sum(dup_genes))
                 rna = rna[:, ~dup_genes]
             except Exception as e:
                 pass
@@ -426,7 +422,6 @@ def preprocess_higlue(args, glue_args):
         rna = ad.read_h5ad(f"{out_dir}/rna/{base_rna_filename}")
     
     sc.pp.filter_genes(rna, min_counts=1)
-    print(rna)
     print('Embedding RNA...')
     print('Highly variable genes...')
     sc.pp.highly_variable_genes(rna, n_top_genes=n_genes, flavor="seurat_v3")
@@ -507,7 +502,6 @@ def preprocess_higlue(args, glue_args):
             print(f'{k} - Total interactions: {total_interactions:,} ({strata_hic.shape[1]:,} from strata {k})')
         
         hic = ad.concat(strata_adatas, axis=1, join='inner')
-        print(hic)
         hic.layers["counts"] = hic.X.copy()
         hic.obs['celltype'] = np.array([dataset.reference.loc[cell + f'.{dataset.res_name}', 'cluster'] for cell in hic.obs_names])
         hic.obs['depth'] = np.array([dataset.reference.loc[cell + f'.{dataset.res_name}', 'depth'] for cell in hic.obs_names])
@@ -517,8 +511,6 @@ def preprocess_higlue(args, glue_args):
         hic.write(base_hic_path, compression="gzip")
     else:
         hic = ad.read_h5ad(base_hic_path)
-    print(hic.var_names[:10])
-    print(hic.var_names[-10:])
     print('Analyzing Hi-C data...')
     top_loop_mask = np.ones(hic.shape[1], dtype=bool)
     if n_distal_interactions is not None:
@@ -654,8 +646,7 @@ def preprocess_higlue(args, glue_args):
     pos_attr = {}
     type_attr = {}
 
-
-    rna.var["in_hic"] = biadjacency_matrix(gene_bait, genes.index).sum(axis=1).A1 != 0
+    rna.var["in_hic"] = biadjacency_matrix(gene_bait, genes.index).sum(axis=1) != 0
     print('Genes in Hi-C', rna.var["in_hic"].sum())
 
     o_prior = overlap_graph.copy()
@@ -671,8 +662,7 @@ def preprocess_higlue(args, glue_args):
             if use_2d_rep and item[-2] == '-' and item.startswith('chr'):
                 continue
         except Exception as e:
-            print(e)
-            print(item)
+            pass
         o_prior.add_edge(item, item, weight=1.0, type="self-loop", sign=1)
     if not use_compartment_signs:
         nx.set_edge_attributes(o_prior, 1, "sign")
@@ -693,8 +683,7 @@ def preprocess_higlue(args, glue_args):
             if use_2d_rep and item[-2] == '-' and item.startswith('chr'):
                 continue
         except Exception as e:
-            print(e)
-            print(item)
+            pass
         d_prior.add_edge(item, item, weight=1.0, type="self-loop", sign=1)
     if not use_compartment_signs:
         nx.set_edge_attributes(d_prior, 1, "sign")
@@ -728,21 +717,17 @@ def preprocess_higlue(args, glue_args):
 
     edge_count = dcq_prior.number_of_edges()
 
-    for i, e in enumerate(dcq_prior.edges(data=True)):
-        if i < 5:
-            print(e)
-        else:
-            break
+    # for i, e in enumerate(dcq_prior.edges(data=True)):
+    #     if i < 5:
+    #         print(e)
+    #     else:
+    #         break
 
     chrom_attr = {}
     strata_attr = {}
     pos_attr = {}
     type_attr = {}
-    test_i = 0
     for n in tqdm(dcq_prior.nodes):
-        if test_i < 5:
-            print(n)
-            test_i += 1
         if n in genes.index:
             type_attr[n] = 'RNA'
             row = genes.loc[n]
@@ -775,8 +760,8 @@ def preprocess_higlue(args, glue_args):
         edge_ids[e] = edge_i
     nx.set_edge_attributes(dcq_prior, edge_ids, "edge_id")
 
-    print(hic.var.head())
-    print(rna.var.head())
+    # print(hic.var.head())
+    # print(rna.var.head())
 
     if use_ice:
         suffix = f'ice_{loop_q}'

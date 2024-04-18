@@ -73,6 +73,8 @@ if __name__ == '__main__':
     glue_parser.add_argument('--h_depth', type=int, default=2)
     glue_parser.add_argument('--neg_samples', type=int, default=10)
     glue_parser.add_argument('--lr', type=float, default=2e-3)
+    glue_parser.add_argument('--max_epochs', type=int, default=None)
+    glue_parser.add_argument('--wandb', action='store_true')
     glue_parser.add_argument('--normalize_u', action='store_true')
     glue_parser.add_argument('--multi_strata_graph_encoder', action='store_true')
     glue_parser.add_argument('--shifted_additive', action='store_true')
@@ -111,6 +113,7 @@ if __name__ == '__main__':
     n_strata = args.n_strata
     neg_samples = args.neg_samples
     lr = args.lr
+    max_epochs = args.max_epochs if args.max_epochs is not None else "AUTO"
     normalize_u = args.normalize_u
     multi_strata_graph_encoder = args.multi_strata_graph_encoder
     full_file_suffix = f"{resolution}_{hic_type}_{loop_q}_{suffix}_{n_strata}"
@@ -121,7 +124,7 @@ if __name__ == '__main__':
     shifted_additive = args.shifted_additive
     use_activation = args.use_activation
     use_attn = args.use_attn
-    use_wandb = True
+    use_wandb = args.wandb
     use_rna_pca = True
     use_batch = args.use_batch
     cache_checkpoint = args.cache_checkpoint
@@ -248,7 +251,7 @@ if __name__ == '__main__':
 
         glue = scglue.models.fit_SCGLUE(
             {"rna": rna, "hic": hic}, prior,
-            log_wandb=True,
+            log_wandb=use_wandb,
             init_kws={"latent_dim": latent_dim, 
                     "use_multi_strata_graph_encoder": multi_strata_graph_encoder, 
                     "shifted_additive": shifted_additive,
@@ -267,6 +270,7 @@ if __name__ == '__main__':
                     "neg_samples": neg_samples,
                     "val_split": 0.05,
                     "data_batch_size": batch_size,
+                    "max_epochs": max_epochs,
                     "wait_n_lrs": 2}
         )
 
