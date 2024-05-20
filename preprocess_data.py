@@ -128,6 +128,7 @@ def preprocess_higlue(args, glue_args):
     load_hic = False
     use_toploops = False 
     use_ice = args.use_ice
+    use_trans = args.use_trans
     use_2d_rep = args.use_2d
     viz_rna = args.viz_rna
     use_raw_pseudobulk = True
@@ -138,6 +139,7 @@ def preprocess_higlue(args, glue_args):
     min_count = args.min_count
     n_distal_interactions = args.distal_interactions
     filter_strata = args.filter_strata
+    exclusive_strata = args.exclusive_strata
     n_genes = args.n_genes
     gene_list = args.gene_list
     bulk_rna_sampling = args.bulk_rna_sampling
@@ -189,6 +191,20 @@ def preprocess_higlue(args, glue_args):
             if use_ice:
                 cooler.balance_cooler(bulk, cis_only=False, store=True)
                 bulk = cooler.Cooler(out_cool_file)
+    # plot example heatmap
+    mat = bulk.matrix(balance=use_ice).fetch('chr10')
+    midpoint = mat.shape[0] // 2
+    mat = mat[midpoint - n_strata:midpoint + n_strata, midpoint - n_strata:midpoint + n_strata]
+    plt.imshow(mat, cmap='Reds', norm=LogNorm())
+    plt.colorbar()
+    plt.savefig(f'{plot_dir}/hic_example.png')
+    plt.close()
+    # if use_trans:
+    #     trans_mat_example = bulk.matrix(balance=False).fetch('chr19', 'chr20')
+    #     plt.imshow(trans_mat_example, cmap='Reds', norm=LogNorm())
+    #     plt.colorbar()
+    #     plt.savefig(f'{plot_dir}/trans_hic_example.png')
+    #     plt.close()
 
     if use_compartment_signs:
         bins = bulk.bins()[:]
@@ -274,6 +290,52 @@ def preprocess_higlue(args, glue_args):
     frags.rename(columns={'start': 'chromStart', 'end': 'chromEnd'}, inplace=True)
     frags['name'] = frags.index.astype(str)
     loops = bulk.pixels(join=False)[:]
+    chr_map = frags['chrom'].to_dict()
+    start_map = frags['chromStart'].to_dict()
+    end_map = frags['chromEnd'].to_dict()
+    loops['chr1'] = loops['bin1_id'].map(chr_map)   
+    loops['chr2'] = loops['bin2_id'].map(chr_map)
+
+    if use_trans:
+        # use total of same loop_q trans loops by transforming based on number of chroms
+        trans_loop_q = 1 - (1 - loop_q) / (len(bulk.chromnames) * (len(bulk.chromnames) - 1) / 2)
+        print(f"Trans loop quantile:{trans_loop_q:.4f}")
+        trans = []
+        used_chrs = []
+        print('Loading trans chromosomal interactions...')
+        for chrom1 in tqdm(bulk.chromnames):
+            chr_trans_pixels = []
+            for chrom2 in bulk.chromnames:
+                if chrom1 == chrom2:
+                    continue
+                if (chrom1, chrom2) in used_chrs or (chrom2, chrom1) in used_chrs:
+                    continue
+                used_chrs.append((chrom1, chrom2))
+                #trans_pixels = bulk.pixels(join=False).fetch(chrom1, chrom2)
+                trans_pixels = loops[(loops['chr1'] == chrom1) & (loops['chr2'] == chrom2)].copy()
+                trans_pixels.drop(columns=['chr1', 'chr2'], inplace=True)
+                chr_trans_pixels.append(trans_pixels)
+            if len(chr_trans_pixels) > 0:
+                chr_trans_pixels = pd.concat(chr_trans_pixels).reset_index(drop=True)
+                chr_trans_pixels['rank'] = chr_trans_pixels['count'].rank(pct=True)
+                print(chr_trans_pixels)
+                try:
+                    loop_cutoff = np.quantile(chr_trans_pixels['rank'].values, q=trans_loop_q)
+                    chr_trans_pixels = chr_trans_pixels.loc[chr_trans_pixels['rank'] >= loop_cutoff].copy()
+                    chr_trans_pixels['rank'] = chr_trans_pixels['rank'].rank(pct=True)
+                    chr_trans_pixels['rank'] = chr_trans_pixels['rank'] * 0.5 + 0.5
+                    print(chr_trans_pixels)
+                    trans.append(chr_trans_pixels)
+                except IndexError:  # no reads in chrom (e.g no chrY)
+                    pass  
+        trans = pd.concat(trans).reset_index(drop=True)
+        print(trans)
+    if exclusive_strata:
+        # remove interactions beyond n_strata
+        loops['strata'] = abs(loops['bin1_id'] - loops['bin2_id'])
+        loops = loops[loops['strata'] <= n_strata].copy()
+        loops.drop(columns=['strata'], inplace=True)
+
     if use_ice:
         weight_map = frags['weight'].to_dict()
         loops['weight1'] = loops['bin1_id'].map(weight_map)
@@ -283,9 +345,7 @@ def preprocess_higlue(args, glue_args):
     else:
         loops['rank'] = loops['count'].rank(pct=True)
     loops.dropna(inplace=True)
-    chr_map = frags['chrom'].to_dict()
-    loops['chr1'] = loops['bin1_id'].map(chr_map)   
-    loops['chr2'] = loops['bin2_id'].map(chr_map)
+    
     loop_dfs = []
     print('Filtering top loops in each chromosome...')
     for chr_name in tqdm(sorted_nicely(bulk.chromnames)):
@@ -298,8 +358,13 @@ def preprocess_higlue(args, glue_args):
         chr_loops['rank'] = chr_loops['rank'] * 0.5 + 0.5
         chr_loops.reset_index(drop=True, inplace=True)
         chr_loops.drop(columns=['chr1', 'chr2'], inplace=True)
+        if use_ice:
+            chr_loops.drop(columns=['weight1', 'weight2', 'oe'], inplace=True)
         loop_dfs.append(chr_loops)
     loops = pd.concat(loop_dfs).reset_index(drop=True)
+    
+    if use_trans:
+        loops = pd.concat([loops, trans]).reset_index(drop=True)
     # if bulk_hic is not None:  # add diagonal signal connecting each bin to its neighbor with a weight of 1
     #     print('Adding diagonal signal...')
     #     a1 = bulk.bins()[:].index[:-1]
@@ -408,8 +473,14 @@ def preprocess_higlue(args, glue_args):
         rna.var['chromStart'] = rna.var['chromStart'].fillna(0).astype(int)
         rna.var['chromEnd'] = rna.var['chromEnd'].fillna(0).astype(int)
         rna.var['strand'] = rna.var['strand'].fillna('+')
-        if not rna.var['chrom'].iloc[0].startswith('chr'):
-            rna.var['chrom'] = 'chr' + rna.var['chrom']
+        rna = rna[:, rna.var['chrom'].notna()].copy()
+        try:
+            if not rna.var['chrom'].iloc[0].startswith('chr'):
+                rna.var['chrom'] = 'chr' + rna.var['chrom']
+        except AttributeError:
+            print(rna.var['chrom'].iloc[0])
+            print(rna.var['chrom'])
+
         drop_cols = []
         for col in rna.var.columns:
             if col not in keep_columns:
@@ -470,7 +541,7 @@ def preprocess_higlue(args, glue_args):
                 new_strata = list(mats[cell_i].diagonal(k=k))
                 if len(new_strata) < len(frags):
                     new_strata += [0] * (len(frags) - len(new_strata))
-                if resolution == '10kb' or resolution == '100kb':
+                if resolution == '10kb' or resolution == '100kb' or resolution == '50kb':
                     strata_mat.append(np.uint8(new_strata))
                 else:
                     strata_mat.append(new_strata)
@@ -488,6 +559,21 @@ def preprocess_higlue(args, glue_args):
             strata_hic.var["chrom"] = split.map(lambda x: x[0])
             strata_hic.var["chromStart"] = split.map(lambda x: x[1]).astype(int)
             strata_hic.var["chromEnd"] = split.map(lambda x: x[2]).astype(int)
+            next_strata_map = frags.copy()
+            next_strata_map['name'] = next_strata_map.apply(lambda row: f"{row['chrom']}:{row['chromStart']}-{row['chromEnd']}", axis=1)
+            roots = next_strata_map['name'].values
+            next_vars = np.roll(roots, shift=-k)
+            print(next_vars)
+            next_vars[-k:] = roots[-k:]
+            next_strata_map['target'] = next_vars
+            next_strata_map = next_strata_map.set_index('name').to_dict()['target']
+
+            strata_hic.var['target'] = strata_hic.var['root'].map(next_strata_map)
+            split = strata_hic.var['target'].str.split(r"[:-]")
+            strata_hic.var["target_chrom"] = split.map(lambda x: x[0])
+            strata_hic.var["target_chromStart"] = split.map(lambda x: x[1]).astype(int)
+            strata_hic.var["target_chromEnd"] = split.map(lambda x: x[2]).astype(int)
+
             if k - loops_offset > 0:  # keep all features for the first strata as roots for later, even if they have no interactions
                 sc.pp.filter_genes(strata_hic, min_counts=min_count)
                 sc.pp.filter_genes(strata_hic, min_cells=min_count)
@@ -547,6 +633,49 @@ def preprocess_higlue(args, glue_args):
     fig = sc.pl.umap(hic, color=["celltype", "batch"], return_fig=True)
     fig.savefig(f'{plot_dir}/pfc_hic_umap_{resolution}.png')
     plt.close()
+
+    # add any pseudobulk loops that are in the scHi-C variable features but weren't loaded before
+    # extra_loops = bulk.pixels(join=False)[:]
+    # extra_loops['chr1'] = extra_loops['bin1_id'].map(chr_map)
+    # extra_loops['chr2'] = extra_loops['bin2_id'].map(chr_map)
+    # extra_loops['start1'] = extra_loops['bin1_id'].map(start_map).astype(int)
+    # extra_loops['start2'] = extra_loops['bin2_id'].map(start_map).astype(int)
+    # extra_loops['end1'] = extra_loops['bin1_id'].map(end_map).astype(int)
+    # extra_loops['end2'] = extra_loops['bin2_id'].map(end_map).astype(int)
+    # if use_ice:
+    #     weight_map = frags['weight'].to_dict()
+    #     extra_loops['weight1'] = extra_loops['bin1_id'].map(weight_map)
+    #     extra_loops['weight2'] = extra_loops['bin2_id'].map(weight_map)
+    #     extra_loops['oe'] = extra_loops['count'] * extra_loops['weight1'] * extra_loops['weight2']
+    #     extra_loops['rank'] = extra_loops['oe'].rank(pct=True)
+    # else:
+    #     extra_loops['rank'] = extra_loops['count'].rank(pct=True)
+    # extra_loops.dropna(inplace=True)
+    # print(extra_loops)
+    # loop_dfs = []
+    # print('Filtering top loops in each chromosome...')
+    # for chr_name in tqdm(sorted_nicely(bulk.chromnames)):
+    #     chr_loops = extra_loops[(extra_loops['chr1'] == chr_name) & (extra_loops['chr2'] == chr_name)].copy()
+    #     chr_schic = hic.var[hic.var['chrom'] == chr_name].copy()
+    #     chr_schic['interaction'] = chr_schic.apply(lambda row: f"{row['chromStart']}-{row['chromEnd']},{row['target_chromStart']}-{row['target_chromEnd']}", axis=1)
+    #     chr_loops['interaction'] = chr_loops.apply(lambda row: f"{row['start1']}-{row['end1']},{row['start2']}-{row['end2']}", axis=1)
+    #     print(chr_schic)
+    #     in_schic = chr_loops['interaction'].isin(chr_schic['interaction'])
+    #     chr_loops = chr_loops[in_schic].copy()
+    #     chr_loops['rank'] = chr_loops['rank'].rank(pct=True)
+    #     # scale rank to (0.5, 1) since the graph decoder uses sigmoid
+    #     chr_loops['rank'] = chr_loops['rank'] * 0.5 + 0.5
+    #     chr_loops.reset_index(drop=True, inplace=True)
+    #     chr_loops.drop(columns=['chr1', 'chr2', 'start1', 'start2', 'end1', 'end2', 'interaction'], inplace=True)
+    #     if use_ice:
+    #         chr_loops.drop(columns=['weight1', 'weight2', 'oe'], inplace=True)
+    #     print(chr_loops)
+    #     loop_dfs.append(chr_loops)
+    # extra_loops = pd.concat(loop_dfs).reset_index(drop=True)
+    # print(extra_loops)
+    # loops = pd.concat([loops, extra_loops]).drop_duplicates(subset=['bin1_id', 'bin2_id']).reset_index(drop=True)
+    # print(loops)
+
     
     genes = scglue.genomics.Bed(rna.var.assign(name=rna.var_names))
     diagonal_mask = hic.var_names.map(lambda s: s[-2] != '-' and s[-3] != '-')

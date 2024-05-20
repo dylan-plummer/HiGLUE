@@ -19,7 +19,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from tqdm import tqdm
 from multiprocessing import Pool
-from sklearn.metrics import accuracy_score, adjusted_rand_score
+from sklearn.metrics import accuracy_score, adjusted_rand_score, silhouette_score
 from networkx.algorithms.bipartite import biadjacency_matrix
 from score.sc_args import parse_args
 from score.utils.utils import anchor_to_locus, anchor_list_to_dict, sorted_nicely
@@ -41,8 +41,10 @@ if __name__ == '__main__':
     glue_parser.add_argument('--min_count', type=int, default=3)
     glue_parser.add_argument('--distal_interactions', type=int, default=None)
     glue_parser.add_argument('--filter_strata', type=float, default=None)
+    glue_parser.add_argument('--exclusive_strata', action='store_true')
     glue_parser.add_argument('--n_genes', type=int, default=10000)
     glue_parser.add_argument('--gene_list', nargs='+', default=None)
+    glue_parser.add_argument('--use_trans', action='store_true')
     glue_parser.add_argument('--bulk_rna_sampling', action='store_true')
     glue_parser.add_argument('--bulk_n_samples', type=int, default=2000)
     glue_parser.add_argument('--bulk_n_counts', type=int, default=1000)
@@ -57,6 +59,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--reference', type=str, default=None)
     glue_parser.add_argument('--resolution', type=str, default='100kb')
     glue_parser.add_argument('--min_depth', type=int, default=40000)
+    glue_parser.add_argument('--max_depth', type=int, default=1000000)
     glue_parser.add_argument('--ignore_chr_filter', action='store_true')
     glue_parser.add_argument('--ignore_filter', action='store_true')
 
@@ -72,6 +75,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--h_dim', type=int, default=128)
     glue_parser.add_argument('--h_depth', type=int, default=2)
     glue_parser.add_argument('--neg_samples', type=int, default=10)
+    glue_parser.add_argument('--wait_n_lrs', type=int, default=2)
     glue_parser.add_argument('--lr', type=float, default=2e-3)
     glue_parser.add_argument('--max_epochs', type=int, default=None)
     glue_parser.add_argument('--wandb', action='store_true')
@@ -81,6 +85,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--use_activation', action='store_true')
     glue_parser.add_argument('--use_attn', action='store_true')
     glue_parser.add_argument('--use_batch', type=str, default=None)
+    glue_parser.add_argument('--use_rna_counts', type=str, default=None)
     glue_parser.add_argument('--cache_checkpoint', type=str, default=None)
 
     glue_args = sys.argv.index('SCORE')
@@ -95,12 +100,14 @@ if __name__ == '__main__':
     resolution = args.resolution
     n_distal_interactions = args.distal_interactions
     filter_strata = args.filter_strata
+    exclusive_strata = args.exclusive_strata
     min_count = args.min_count
     n_genes = args.n_genes
     hic_type = 'raw'
     if args.use_ice:
         hic_type = 'ice'
     loop_q = args.loop_q
+    use_trans = args.use_trans
     hic_weight = args.hic_weight
     n_neighbors = args.n_neighbors
     lam_align = args.lam_align
@@ -112,6 +119,7 @@ if __name__ == '__main__':
     h_depth = args.h_depth
     n_strata = args.n_strata
     neg_samples = args.neg_samples
+    wait_n_lrs = args.wait_n_lrs
     lr = args.lr
     max_epochs = args.max_epochs if args.max_epochs is not None else "AUTO"
     normalize_u = args.normalize_u
@@ -125,7 +133,7 @@ if __name__ == '__main__':
     use_activation = args.use_activation
     use_attn = args.use_attn
     use_wandb = args.wandb
-    use_rna_pca = True
+    use_rna_pca = not args.use_rna_counts
     use_batch = args.use_batch
     cache_checkpoint = args.cache_checkpoint
     min_confidence = 0.4
@@ -139,8 +147,14 @@ if __name__ == '__main__':
         rna = ad.read_h5ad(f"{out_dir}/rna/rna_{full_file_suffix}.h5ad")
         
         hic = ad.read_h5ad(f"{out_dir}/hic/hic_{full_file_suffix}.h5ad")
-        hic.obs.loc[hic.obs_names.str.startswith('alpha_'), 'celltype'] = 'Alpha'
-        hic.obs.loc[hic.obs_names.str.startswith('beta_'), 'celltype'] = 'Beta'
+        try:
+            hic.obs.loc[hic.obs_names.str.startswith('alpha_'), 'celltype'] = 'Alpha'
+        except Exception as e:
+            print(e)
+        try:
+            hic.obs.loc[hic.obs_names.str.startswith('beta_'), 'celltype'] = 'Beta'
+        except Exception as e:
+            print(e)
 
         rna.var["highly_variable"] = rna.var["highly_variable"] & rna.var["in_hic"]
         hic.var["highly_variable"] = True
@@ -231,6 +245,7 @@ if __name__ == '__main__':
                             'n_strata': n_strata,
                             'batch_size': batch_size,
                             'neg_samples': neg_samples,
+                            'use_trans': use_trans,
                             'normalize_u': normalize_u,
                             'shifted_additive': shifted_additive,
                             'use_activation': use_activation,
@@ -271,7 +286,7 @@ if __name__ == '__main__':
                     "val_split": 0.05,
                     "data_batch_size": batch_size,
                     "max_epochs": max_epochs,
-                    "wait_n_lrs": 2}
+                    "wait_n_lrs": wait_n_lrs}
         )
 
         glue.save(f"{out_dir}/glue_hic_{prior_name}_prior_{resolution}_{n_genes}_{n_strata}.dill")
@@ -307,10 +322,14 @@ if __name__ == '__main__':
             accuracy = accuracy_score(hic.obs['old_celltype_int'], hic.obs['celltype_int'])
             ari = adjusted_rand_score(hic.obs['old_celltype_int'], hic.obs['celltype_int'])
             ari_leiden = adjusted_rand_score(hic.obs['old_celltype_int'], hic.obs['leiden'])
+            sil_score_leiden = silhouette_score(hic.obsm['X_glue'], hic.obs['leiden'])
+            sil_score_joint = silhouette_score(hic.obsm['X_glue'], hic.obs['celltype_int'])
             if use_wandb:
                 wandb.log({"accuracy": accuracy, 
                         "ari": ari_leiden,
-                        "ari_label_transfer": ari})
+                        "ari_label_transfer": ari,
+                        "silhouette_score_leiden": sil_score_leiden,
+                        "silhouette_score_joint": sil_score_joint})
 
             # also do the same for RNA
             rna_celltypes = rna.obs['celltype'].unique()
@@ -322,9 +341,11 @@ if __name__ == '__main__':
             #rna.obs['celltype_int'].fillna(len(rna_celltypes), inplace=True)
             rna_accuracy = accuracy_score(rna.obs['old_celltype_int'], rna.obs['leiden'])
             rna_ari = adjusted_rand_score(rna.obs['old_celltype_int'], rna.obs['leiden'])
+            rna_sil_score = silhouette_score(rna.obsm['X_glue'], rna.obs['leiden'])
             if use_wandb:
                 wandb.log({"rna_accuracy": rna_accuracy, 
-                        "rna_ari": rna_ari})
+                        "rna_ari": rna_ari,
+                        "rna_silhouette_score": rna_sil_score})
 
             # remove low confidence cells
             hic = hic[hic.obs['celltype_confidence'] > min_confidence, :].copy()
