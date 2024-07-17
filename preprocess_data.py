@@ -22,6 +22,7 @@ from scipy.sparse import coo_matrix, csr_matrix
 from networkx.algorithms.bipartite import biadjacency_matrix
 from score.sc_args import parse_args
 from score.utils.utils import anchor_to_locus, anchor_list_to_dict, sorted_nicely
+from score.utils.matrix_ops import OE_norm
 
 def get_processed_matrix(dataset, cell, cell_i, preprocessing, chr_only=None):
     c = cooler.Cooler(f"{dataset.scool_file}::/cells/{cell}")
@@ -128,6 +129,7 @@ def preprocess_higlue(args, glue_args):
     load_hic = False
     use_toploops = False 
     use_ice = args.use_ice
+    use_dist_norm = args.use_dist_norm
     use_trans = args.use_trans
     use_2d_rep = args.use_2d
     viz_rna = args.viz_rna
@@ -140,12 +142,17 @@ def preprocess_higlue(args, glue_args):
     n_distal_interactions = args.distal_interactions
     filter_strata = args.filter_strata
     exclusive_strata = args.exclusive_strata
+    use_xy = args.use_xy
     n_genes = args.n_genes
     gene_list = args.gene_list
     bulk_rna_sampling = args.bulk_rna_sampling
     n_samples_each = args.bulk_n_samples
     counts_per_cell = args.bulk_n_counts
     bulk_hic = args.bulk_hic
+    coexpression_network = args.coexpression_network
+    coexpression_edges = args.coexpression_edges
+    cis_coexpression = args.cis_coexpression
+    snapatac_init = args.snapatac_init
     n_loops = 1000000 
     if not use_toploops:
         loop_q = float(loop_q)
@@ -345,12 +352,35 @@ def preprocess_higlue(args, glue_args):
     else:
         loops['rank'] = loops['count'].rank(pct=True)
     loops.dropna(inplace=True)
+
+    # if use_dist_norm:
+    #     # extract each dense matrix and compute OE normalization
+    #     print('OE normalizing Hi-C data...')
+    #     oe_loops = []
+    #     for chr_name in tqdm(sorted_nicely(bulk.chromnames)):
+    #         chr_mat = bulk.matrix(balance=use_ice).fetch(chr_name)
+    #         chr_mat = OE_norm(chr_mat.A)
+    #         chr_mat = csr_matrix(chr_mat)
+    #         chr_anchors = frags[frags['chrom'] == chr_name].copy()
+    #         chr_anchors.reset_index(drop=True, inplace=True)
+    #         chr_anchor_dict = anchor_list_to_dict(chr_anchors['name'].values)
+    #         rows = np.vectorize(anchor_to_locus(chr_anchor_dict))(loops.loc[loops['chr1'] == chr_name, 'bin1_id'].values)
+    #         cols = np.vectorize(anchor_to_locus(chr_anchor_dict))(loops.loc[loops['chr2'] == chr_name, 'bin2_id'].values)
+    #         oe_values = chr_mat[rows, cols]
+    #         chr_loops = loops.loc[(loops['chr1'] == chr_name) & (loops['chr2'] == chr_name)].copy()
+    #         chr_loops['oe'] = oe_values
+    #         oe_loops.append(chr_loops)
+    #     loops = pd.concat(oe_loops).reset_index(drop=True)
+    #     loops['rank'] = loops['oe'].rank(pct=True)
+    #     print(loops)
     
     loop_dfs = []
     print('Filtering top loops in each chromosome...')
     for chr_name in tqdm(sorted_nicely(bulk.chromnames)):
+        if not use_xy and ('x' in chr_name.lower() or 'y' in chr_name.lower()):
+            continue
         chr_loops = loops[(loops['chr1'] == chr_name) & (loops['chr2'] == chr_name)].copy()
-        chr_loops['rank'] = chr_loops['oe' if use_ice else 'count'].rank(pct=True)
+        chr_loops['rank'] = chr_loops['oe' if use_ice or use_dist_norm else 'count'].rank(pct=True)
         loop_cutoff = np.quantile(chr_loops['rank'].values, q=loop_q)
         chr_loops = chr_loops.loc[chr_loops['rank'] >= loop_cutoff].copy()
         chr_loops['rank'] = chr_loops['rank'].rank(pct=True)
@@ -372,7 +402,8 @@ def preprocess_higlue(args, glue_args):
     #     diag = pd.DataFrame({'bin1_id': a1, 'bin2_id': a2, 'count': 1, 'rank': 1.0})
     #     loops = pd.concat([loops, diag], ignore_index=True)
     print(loops)
-
+    if not use_xy:
+        frags = frags[~frags['chrom'].str.lower().str.contains('x|y')].reset_index(drop=True)
     frags.rename(columns={'start': 'chromStart', 'end': 'chromEnd'}, inplace=True)
 
     if use_2d_rep:
@@ -487,6 +518,8 @@ def preprocess_higlue(args, glue_args):
                 drop_cols.append(col)
         rna.var.drop(columns=drop_cols, inplace=True)
         rna = rna[:, rna.var['chrom'].notna()].copy()
+        if not use_xy:
+            rna = rna[:, ~rna.var['chrom'].str.lower().str.contains('x|y')].copy()
         genes = scglue.genomics.Bed(rna.var.assign(name=rna.var_names))
         rna.write(f"{out_dir}/rna/{base_rna_filename}", compression="gzip")
     else:
@@ -495,12 +528,44 @@ def preprocess_higlue(args, glue_args):
     sc.pp.filter_genes(rna, min_counts=1)
     print('Embedding RNA...')
     print('Highly variable genes...')
+    
     sc.pp.highly_variable_genes(rna, n_top_genes=n_genes, flavor="seurat_v3")
     if gene_list is not None:
         for gene in gene_list:
             if gene in rna.var_names:
                 print(gene)
                 rna.var.loc[gene, 'highly_variable'] = True
+    if coexpression_network is not None:
+        coexpression_network = pd.read_csv(coexpression_network, sep='\t')
+        print(coexpression_network)
+        chrom_map = rna.var['chrom'].to_dict()
+        coexpression_network['chrom1'] = coexpression_network['gene1'].map(chrom_map)
+        coexpression_network['chrom2'] = coexpression_network['gene2'].map(chrom_map)
+        print(coexpression_network['chrom1'].unique())
+        print(coexpression_network['chrom2'].unique())
+        coexpression_network.dropna(subset=['chrom1', 'chrom2'], inplace=True)
+        coexpression_network = coexpression_network[coexpression_network['chrom1'] != 'chrM']
+        coexpression_network = coexpression_network[coexpression_network['chrom2'] != 'chrM']
+        if cis_coexpression:
+            coexpression_network = coexpression_network[coexpression_network['chrom1'] == coexpression_network['chrom2']]
+        coexpression_network = coexpression_network[coexpression_network['gene1'].isin(rna.var_names)]
+        coexpression_network = coexpression_network[coexpression_network['gene2'].isin(rna.var_names)]
+        print(coexpression_network['chrom1'].unique())
+        print(coexpression_network['chrom2'].unique())
+        coexpression_network = coexpression_network[['gene1', 'gene2', 'weight']].reset_index(drop=True)
+        print(coexpression_network)
+        coexpression_network.sort_values(by='weight', ascending=False, inplace=True)
+        coexpression_network = coexpression_network.iloc[:coexpression_edges].copy().reset_index(drop=True)
+        print(coexpression_network)
+        coexpression_graph = nx.from_pandas_edgelist(coexpression_network, source="gene1", target="gene2", edge_attr=True, create_using=nx.DiGraph)
+        print(coexpression_graph)
+        for i, row in coexpression_network.iterrows():
+            gene1 = row['gene1']
+            gene2 = row['gene2']
+            if gene1 in rna.var_names and gene2 in rna.var_names:
+                rna.var.loc[gene1, 'highly_variable'] = True
+                rna.var.loc[gene2, 'highly_variable'] = True
+        
     # # #sc.pp.highly_variable_genes(rna, min_mean=0.0125, max_mean=3, min_disp=0.5)
     print("Normalize")
     sc.pp.normalize_total(rna)
@@ -550,15 +615,23 @@ def preprocess_higlue(args, glue_args):
             strata_hic.obs_names = sorted(dataset.cell_list)
             strata_hic.obs_names = strata_hic.obs_names.map(lambda s: s.replace(f'.{dataset.res_name}', ''))
             genomic_pos = dataset.anchor_list.apply(lambda row: f"{row['chr']}:{row['start']}-{row['end']}", axis=1)
+            # if not use_xy:
+            #     genomic_pos = genomic_pos[~genomic_pos.str.lower().str.contains('x|y')].reset_index(drop=True)
             if k - loops_offset == 0:
                 strata_hic.var_names = genomic_pos
             else:
-                strata_hic.var_names = genomic_pos + f'-{k - loops_offset}'
+                print(strata_hic.var_names.shape, genomic_pos.shape)
+                if strata_hic.var_names.shape != genomic_pos.shape:
+                    strata_hic.var_names = genomic_pos.iloc[:-(k - loops_offset)] + f'-{k - loops_offset}'
+                else:
+                    strata_hic.var_names = genomic_pos + f'-{k - loops_offset}'
             strata_hic.var['root'] = strata_hic.var_names.map(lambda s: s.rsplit('-', 1)[0] if (s[-2] == '-' or s[-3] == '-') else s)
             split = strata_hic.var['root'].str.split(r"[:-]")
             strata_hic.var["chrom"] = split.map(lambda x: x[0])
             strata_hic.var["chromStart"] = split.map(lambda x: x[1]).astype(int)
             strata_hic.var["chromEnd"] = split.map(lambda x: x[2]).astype(int)
+            if not use_xy:
+                strata_hic = strata_hic[:, ~strata_hic.var['chrom'].str.lower().str.contains('x|y')].copy()
             next_strata_map = frags.copy()
             next_strata_map['name'] = next_strata_map.apply(lambda row: f"{row['chrom']}:{row['chromStart']}-{row['chromEnd']}", axis=1)
             roots = next_strata_map['name'].values
@@ -632,8 +705,36 @@ def preprocess_higlue(args, glue_args):
     sc.tl.umap(hic)
     fig = sc.pl.umap(hic, color=["celltype", "batch"], return_fig=True)
     fig.savefig(f'{plot_dir}/pfc_hic_umap_{resolution}.png')
-    plt.close()
+    plt.close() 
 
+    if snapatac_init:
+        # test SnapATAC2 embedding init
+        import snapatac2 as snap
+        hic_snap = ad.AnnData(csr_matrix(np.uint32(hic.layers["counts"])), obs=hic.obs.copy(), var=hic.var.copy())
+        hic_snap.obsm['fragment_paired'] = csr_matrix(np.uint32(hic.layers["counts"]))
+        content_of_scool = cooler.fileops.list_coolers(dataset.scool_file)
+        c = cooler.Cooler(f"{dataset.scool_file}::/{content_of_scool[0]}")
+        chr_sizes = c.chromsizes
+        reference_sequences = pd.DataFrame({'chr': chr_sizes.index, 'size': chr_sizes.values})
+        reference_sequences.rename(columns={'chr': 'reference_seq_name', 'size': 'reference_seq_length'}, inplace=True)
+        reference_sequences['reference_seq_length'] = reference_sequences['reference_seq_length'].astype(pd.UInt64Dtype())
+        hic_snap.uns['reference_sequences'] = reference_sequences
+        # reset var and var_names
+        # hic.X = None
+        # hic.var = pd.DataFrame()
+        # hic.var_names = pd.Index([])
+
+        #snap.pp.add_tile_matrix(hic, counting_strategy='fragment', bin_size=10)
+        #hic.X = 
+        print(hic_snap)
+        snap.pp.select_features(hic_snap, n_features=min(hic.shape[1], 250000))
+        snap.tl.spectral(hic_snap, n_comps=100)
+        hic.obsm['X_lsi'] = hic_snap.obsm['X_spectral']
+        sc.pp.neighbors(hic, use_rep="X_lsi")
+        sc.tl.umap(hic)
+        fig = sc.pl.umap(hic, color=["celltype", "batch"], return_fig=True)
+        fig.savefig(f'{plot_dir}/pfc_hic_umap_{resolution}_snap.png')
+        plt.close()
     # add any pseudobulk loops that are in the scHi-C variable features but weren't loaded before
     # extra_loops = bulk.pixels(join=False)[:]
     # extra_loops['chr1'] = extra_loops['bin1_id'].map(chr_map)
@@ -683,6 +784,8 @@ def preprocess_higlue(args, glue_args):
     peaks = scglue.genomics.Bed(diagonal_anchors.assign(name=hic.var_names[diagonal_mask]))
     tss = genes.strand_specific_start_site()
     promoters = tss.expand(2000, 0)
+
+    
 
     frags['peak_name'] = frags.apply(lambda row: f"{row['chrom']}:{row['chromStart']}-{row['chromEnd']}", axis=1)
     if use_compartment_signs:
@@ -764,6 +867,7 @@ def preprocess_higlue(args, glue_args):
     frags = scglue.genomics.Bed(frags)
     bait_oe.rename(columns={'rank': 'weight'}, inplace=True)
     pchic_graph = nx.from_pandas_edgelist(bait_oe, source="peak1", target="peak2", edge_attr=True, create_using=nx.DiGraph)
+    
 
     nx.set_edge_attributes(pchic_graph, "hic", "type")
     nx.set_edge_attributes(pchic_graph, 1, "sign")
@@ -820,8 +924,17 @@ def preprocess_higlue(args, glue_args):
     d_prior = d_prior.subgraph(hvg_reachable)
     print(pchic_graph)
     pchic_graph = scglue.graph.compose_multigraph(pchic_graph, pchic_graph.reverse())
+    
     print('Composing overlap graph with Hi-C graph...')
     dcq_prior = scglue.graph.compose_multigraph(o_prior, pchic_graph)
+    if coexpression_network is not None:
+        print('Adding coexpression network...')
+        nx.set_edge_attributes(coexpression_graph, "coexpression", "type")
+        nx.set_edge_attributes(coexpression_graph, 1, "sign")
+        coexpression_graph = scglue.graph.compose_multigraph(coexpression_graph, coexpression_graph.reverse())
+        print('Composing coexpression network with Hi-C graph...')
+        dcq_prior = scglue.graph.compose_multigraph(dcq_prior, coexpression_graph)
+        print(dcq_prior)
 
     hvg_reachable = scglue.graph.reachable_vertices(dcq_prior, rna.var.query("highly_variable").index)
 

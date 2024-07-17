@@ -32,6 +32,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--loop_q', type=str, default='0.99')
     glue_parser.add_argument('--n_strata', type=int, default=5)
     glue_parser.add_argument('--use_ice', action='store_true')
+    glue_parser.add_argument('--use_dist_norm', action='store_true')
     glue_parser.add_argument('--use_2d', action='store_true')
     glue_parser.add_argument('--viz_rna', action='store_true')
     glue_parser.add_argument('--load_rna', action='store_true')
@@ -42,13 +43,19 @@ if __name__ == '__main__':
     glue_parser.add_argument('--distal_interactions', type=int, default=None)
     glue_parser.add_argument('--filter_strata', type=float, default=None)
     glue_parser.add_argument('--exclusive_strata', action='store_true')
+    glue_parser.add_argument('--use_xy', action='store_true')
     glue_parser.add_argument('--n_genes', type=int, default=10000)
     glue_parser.add_argument('--gene_list', nargs='+', default=None)
+    glue_parser.add_argument('--no_depth_correction', action='store_true')
     glue_parser.add_argument('--use_trans', action='store_true')
     glue_parser.add_argument('--bulk_rna_sampling', action='store_true')
     glue_parser.add_argument('--bulk_n_samples', type=int, default=2000)
     glue_parser.add_argument('--bulk_n_counts', type=int, default=1000)
     glue_parser.add_argument('--bulk_hic', type=str, default=None)
+    glue_parser.add_argument('--coexpression_network', type=str, default=None)
+    glue_parser.add_argument('--coexpression_edges', type=int, default=10000)
+    glue_parser.add_argument('--cis_coexpression', action='store_true')
+    glue_parser.add_argument('--snapatac_init', action='store_true')
 
     # SCORE args
     glue_parser.add_argument('--rna_file', type=str, default=None)
@@ -84,8 +91,9 @@ if __name__ == '__main__':
     glue_parser.add_argument('--shifted_additive', action='store_true')
     glue_parser.add_argument('--use_activation', action='store_true')
     glue_parser.add_argument('--use_attn', action='store_true')
+    glue_parser.add_argument('--binarize', action='store_true')
     glue_parser.add_argument('--use_batch', type=str, default=None)
-    glue_parser.add_argument('--use_rna_counts', type=str, default=None)
+    glue_parser.add_argument('--use_rna_counts', action='store_true')
     glue_parser.add_argument('--cache_checkpoint', type=str, default=None)
 
     glue_args = sys.argv.index('SCORE')
@@ -101,6 +109,7 @@ if __name__ == '__main__':
     n_distal_interactions = args.distal_interactions
     filter_strata = args.filter_strata
     exclusive_strata = args.exclusive_strata
+    use_xy = args.use_xy
     min_count = args.min_count
     n_genes = args.n_genes
     hic_type = 'raw'
@@ -108,6 +117,7 @@ if __name__ == '__main__':
         hic_type = 'ice'
     loop_q = args.loop_q
     use_trans = args.use_trans
+    depth_correction = not args.no_depth_correction
     hic_weight = args.hic_weight
     n_neighbors = args.n_neighbors
     lam_align = args.lam_align
@@ -132,11 +142,13 @@ if __name__ == '__main__':
     shifted_additive = args.shifted_additive
     use_activation = args.use_activation
     use_attn = args.use_attn
+    binarize = args.binarize
     use_wandb = args.wandb
     use_rna_pca = not args.use_rna_counts
     use_batch = args.use_batch
     cache_checkpoint = args.cache_checkpoint
     min_confidence = 0.4
+    snapatac_init = args.snapatac_init
 
     if args.preprocess:
         preprocess_higlue(args, glue_args)
@@ -171,6 +183,11 @@ if __name__ == '__main__':
             batch_hic.obs['depth'] = batch_hic.obs['depth'] / batch_hic.obs['depth'].max()
             hic.obs.loc[mask, 'depth'] = batch_hic.obs['depth'].values
 
+        if binarize:
+            hic.X = np.int32(hic.X > 0)
+            hic.layers['counts_pre_binarize'] = hic.layers['counts'].copy()
+            hic.layers['counts'] = hic.X.copy()
+
         celltypes = hic.obs['celltype'].unique()
         n_clusters = len(celltypes)
         colors = list(plt.cm.tab20(np.int32(np.linspace(0, n_clusters + 0.99, n_clusters))))
@@ -199,9 +216,9 @@ if __name__ == '__main__':
                                 'Neu-mat': 'Neu',
                                 'OPC': 'OPC',
                                 'Oligodendrocyte': 'ODC'}
-            #rna = rna[rna.obs['region'] == 'PFC', :]
-            #rna = rna[~rna.obs['celltype'].isin(['Neu-NRGN-I', 'Neu-NRGN-II', 'Neu-mat'])]
-            rna = rna[~rna.obs['celltype'].isin(['Neu-NRGN-I', 'Neu-NRGN-II'])]
+            rna = rna[rna.obs['region'] == 'PFC', :]
+            rna = rna[~rna.obs['celltype'].isin(['Neu-NRGN-I', 'Neu-NRGN-II', 'Neu-mat'])]
+            #rna = rna[~rna.obs['celltype'].isin(['Neu-NRGN-I', 'Neu-NRGN-II'])]
             rna = rna[rna.obs['celltype'].isin(neurons_rna_celltypes)]
             color_map = {
                 "L2/3": [230, 25, 75],
@@ -217,6 +234,49 @@ if __name__ == '__main__':
             color_map['Neu_rna'] = 'gray'
 
             rna.obs['celltype'] = rna.obs['celltype'].map(rna_celltype_map)
+        elif 'human_brain' in dataset_name:
+            neurons_rna_celltypes = ['IN-PV', 'IN-SST', 'IN-VIP', 'IN-SV2C', 'Neu-mat',
+                      'L2/3', 'L4', 'L5', 'L5/6', 'L6', 'L5/6-CC']
+            neurons_hic_celltypes = ['L2/3', 'L4', 'L5', 'L6', 'Ndnf', 'Pvalb', 'Sst', 'Vip']  
+
+            rna_celltype_map = {'Amygdala excitatory': 'Amy-Exc',
+                                'Deep-layer corticothalamic and 6b': 'L6b',
+                                'Deep-layer intratelencephalic': 'L2/3-IT',
+                                'Upper-layer intratelencephalic': 'L2/3-IT',
+                                'Deep-layer near-projecting': 'L5/6-NP',
+                                'Eccentric medium spiny neuron': 'MSN-D1',
+                                'Medium spiny neuron': 'MSN-D1',
+                                'LAMP5-LHX6 and Chandelier': 'Lamp5-Lhx6',
+                                'INT-LAMP5': 'Lamp5',
+                                'L4 IT': 'L4-IT',
+                                'L2/3 IT': 'L2/3-IT',
+                                'L5 IT': 'L5-IT',
+                                'L6 IT Car3': 'L6-IT-Car3',
+                                'INT-VIP': 'Vip',
+                                'INT-PVALB': 'Pvalb',
+                                'INT-SST': 'Sst',
+                                'L6 IT': 'L6-IT',
+                                'CHAND': 'Pvalb-ChC',
+                                'INT-SST-CHODL': 'Sst',
+                                'INT-LAMP5-LHX6': 'Lamp5-Lhx6',
+                                'L6 CT': 'L6-CT',
+                                'L5/6 NP': 'L5/6-NP'
+                                }
+            remove_rna_celltypes = ['CB-GRAN', 'CB-MolLayerInt1', 'CB-MolLayerInt2', 'CGE interneuron', 'CB-PURK',
+                                    'CB-PurkLayerInt', 'CB-GranLayerInt', 'UBC', 'Pax6',
+                                    'DG-GRAN', 'Hippocampal CA1-3', 'Hippocampal CA4',
+                                    'Upper rhombic lip', 'Midbrain-derived inhibitory', 'Thalamic excitatory', 'Miscellaneous',
+                                    'Lower rhombic lip', 'Mammillary body', 'Splatter']
+
+            hic_celltype_map = {}
+            for celltype in rna.obs['celltype'].unique():
+                if celltype not in rna_celltype_map:
+                    rna_celltype_map[celltype] = celltype
+            for celltype in hic.obs['celltype'].unique():
+                if celltype not in hic_celltype_map:
+                    hic_celltype_map[celltype] = celltype
+            rna.obs['celltype'] = rna.obs['celltype'].map(rna_celltype_map)
+
         rna_celltypes = rna.obs['celltype'].unique()
         for celltype in rna_celltypes:
             if celltype not in celltypes:
@@ -233,6 +293,7 @@ if __name__ == '__main__':
                             'hic_type': hic_type,
                             'loop_q': loop_q,
                             'suffix': suffix, 
+                            'min_depth': min_depth,
                             'n_distal_interactions': n_distal_interactions,
                             'counts_per_cell_rna': counts_per_cell,
                             'filter_strata': filter_strata,
@@ -250,7 +311,10 @@ if __name__ == '__main__':
                             'shifted_additive': shifted_additive,
                             'use_activation': use_activation,
                             'use_attn': use_attn,
+                            'binarize': binarize,
                             'multi_strata_graph_encoder': multi_strata_graph_encoder,
+                            'coexpression_network': args.coexpression_network,
+                            'coexpression_edges': args.coexpression_edges,
                             'lr': lr,
                             'hic_weight': hic_weight,
                             'n_neighbors': n_neighbors,
@@ -258,9 +322,9 @@ if __name__ == '__main__':
                             'lam_graph': lam_graph})
 
         scglue.models.configure_dataset(rna, "NB", use_highly_variable=True, use_layer="counts", use_rep="X_pca" if use_rna_pca else None,
-                                        use_cell_type=None, use_batch=use_batch, use_depth="depth")
-        scglue.models.configure_dataset(hic, "HiCZINB", use_highly_variable=True, use_layer="counts", 
-                                        use_depth="depth", use_batch="batch")
+                                        use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None)
+        scglue.models.configure_dataset(hic, "HiCZINB", use_highly_variable=True, use_layer="counts", use_rep="X_lsi" if snapatac_init else None,
+                                        use_depth="depth" if depth_correction else None, use_batch="batch")
 
         print(f"Total nodes in prior: {len(prior.nodes)}")
 
@@ -272,6 +336,7 @@ if __name__ == '__main__':
                     "shifted_additive": shifted_additive,
                     "use_activation": use_activation,
                     "use_attn": use_attn,
+                    "binarize": binarize,
                     "h_dim": h_dim,
                     "h_depth": h_depth,
                     "n_strata": n_strata},
@@ -291,6 +356,7 @@ if __name__ == '__main__':
 
         glue.save(f"{out_dir}/glue_hic_{prior_name}_prior_{resolution}_{n_genes}_{n_strata}.dill")
         if cache_checkpoint:
+            os.makedirs(cache_checkpoint, exist_ok=True)
             n_checkpoints = len(os.listdir(cache_checkpoint))
             glue.save(f"{cache_checkpoint}/glue_hic_{prior_name}_prior_{resolution}_{n_checkpoints}.dill")
         # embed and visualize
@@ -324,10 +390,12 @@ if __name__ == '__main__':
             ari_leiden = adjusted_rand_score(hic.obs['old_celltype_int'], hic.obs['leiden'])
             sil_score_leiden = silhouette_score(hic.obsm['X_glue'], hic.obs['leiden'])
             sil_score_joint = silhouette_score(hic.obsm['X_glue'], hic.obs['celltype_int'])
+            sil_celltype = silhouette_score(hic.obsm['X_glue'], hic.obs['old_celltype_int'])
             if use_wandb:
                 wandb.log({"accuracy": accuracy, 
                         "ari": ari_leiden,
                         "ari_label_transfer": ari,
+                        "celltype_asw": sil_celltype,
                         "silhouette_score_leiden": sil_score_leiden,
                         "silhouette_score_joint": sil_score_joint})
 
@@ -414,7 +482,7 @@ if __name__ == '__main__':
 
         # save combined data
         os.makedirs(f"{out_dir}/combined_embedding", exist_ok=True)
-        combined.write(f"{out_dir}/combined_embedding/combined_{full_file_suffix}.h5ad", compression="gzip")
+        #combined.write(f"{out_dir}/combined_embedding/combined_{full_file_suffix}.h5ad", compression="gzip")
 
         if 'islet' in dataset_name:
             sorted_hic = hic[hic.obs_names.str.startswith('alpha_') | hic.obs_names.str.startswith('beta_')]
@@ -438,6 +506,43 @@ if __name__ == '__main__':
             val_ari = adjusted_rand_score(confident_filtered_hic.obs['celltype_int'], confident_filtered_hic.obs['pred_celltype_int'])
             if use_wandb:
                 wandb.log({"val_accuracy_filtered": val_accuracy, "val_ari_filtered": val_ari})
+
+        # try to save tmp vizualizations as animated gifs
+        # try:
+        #     import imageio
+        #     frame_duration = 0.2
+        #     pca_dir = 'tmp_imgs/pca'
+        #     with imageio.get_writer('pca.gif', mode='I', duration=frame_duration, loop=0) as writer:
+        #         pretrain_files = [f for f in sorted_nicely(os.listdir(pca_dir)) if 'pretrain' in f]
+        #         finetune_files = [f for f in sorted_nicely(os.listdir(pca_dir)) if 'finetune' in f]
+        #         for filename in pretrain_files + finetune_files + [finetune_files[-1]] * 20:
+        #             filepath = os.path.join(pca_dir, filename)
+        #             image = imageio.imread(filepath)
+        #             writer.append_data(image)
+        #         for filename in pretrain_files + finetune_files:
+        #             try:
+        #                 os.remove(filepath)
+        #             except Exception:
+        #                 pass
+        #     if use_wandb:
+        #         wandb.log({"pca_gif": wandb.Image('pca.gif')})
+        #     umap_dir = 'tmp_imgs/umap'
+        #     with imageio.get_writer('umap.gif', mode='I', duration=frame_duration, loop=0) as writer:
+        #         pretrain_files = [f for f in sorted_nicely(os.listdir(umap_dir)) if 'pretrain' in f]
+        #         finetune_files = [f for f in sorted_nicely(os.listdir(umap_dir)) if 'finetune' in f]
+        #         for filename in pretrain_files + finetune_files + [finetune_files[-1]] * 20:
+        #             filepath = os.path.join(umap_dir, filename)
+        #             image = imageio.imread(filepath)
+        #             writer.append_data(image)
+        #         for filename in pretrain_files + finetune_files:
+        #             try:
+        #                 os.remove(filepath)
+        #             except Exception:
+        #                 pass
+        #     if use_wandb:
+        #         wandb.log({"umap_gif": wandb.Image('umap.gif')})
+        # except Exception as e:
+        #     print(e)
 
         if use_wandb:
             wandb.finish()
