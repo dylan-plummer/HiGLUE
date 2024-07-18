@@ -498,6 +498,9 @@ if __name__ == '__main__':
             val_ari = adjusted_rand_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
             if use_wandb:
                 wandb.log({"val_accuracy": val_accuracy, "val_ari": val_ari})
+            val_celltype_asw = silhouette_score(sorted_hic.obsm['X_glue'], sorted_hic.obs['celltype_int'])
+            if use_wandb:
+                wandb.log({"val_celltype_asw": val_celltype_asw})
 
             confident_filtered_hic = sorted_hic[sorted_hic.obs['celltype_confidence'] > min_confidence, :].copy()
             confident_filtered_hic = confident_filtered_hic[confident_filtered_hic.obs['depth'] > min_depth, :]
