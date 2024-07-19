@@ -124,6 +124,7 @@ def preprocess_higlue(args, glue_args):
     resolution = args.resolution
     gtf_file = args.gtf
     rna_file = args.rna_file
+    atac_file = args.atac_file
     loop_q = args.loop_q
     load_rna = args.load_rna
     load_hic = False
@@ -582,6 +583,38 @@ def preprocess_higlue(args, glue_args):
         fig.savefig(f"{plot_dir}/rna_umap.png")
         plt.close()
 
+    if atac_file is not None:
+        atac = ad.read_h5ad(atac_file)
+        if 'batch' not in rna.obs.columns:
+            rna.obs['batch'] = 0
+        atac.layers["counts"] = atac.X.copy()
+        atac.var['chrom'] = atac.var_names.map(lambda s: s.split(':')[0])
+        atac.var['chromStart'] = atac.var_names.map(lambda s: s.split(':')[1].split('-')[0]).astype(int)
+        atac.var['chromEnd'] = atac.var_names.map(lambda s: s.split(':')[1].split('-')[1]).astype(int)
+        atac.var['name'] = atac.var_names
+        atac = atac[:, atac.var['chrom'].notna()].copy()
+        # only accept chroms 1-22, X and Y
+        atac = atac[:, atac.var['chrom'].isin([f'chr{i}' for i in range(1, 23)] + ['chrX', 'chrY'])].copy()
+        atac_peaks = scglue.genomics.Bed(atac.var.assign(name=atac.var_names))
+        
+        sc.pp.filter_genes(atac, min_counts=2)
+        print(atac.var_names)
+        sc.pp.highly_variable_genes(atac, n_top_genes=n_genes, flavor="seurat_v3")
+        sc.pp.normalize_total(atac)
+        sc.pp.log1p(atac)
+        sc.pp.scale(atac)
+        sc.tl.pca(atac, n_comps=100, svd_solver="auto")
+        # compute lsi
+        # scglue.data.lsi(atac, n_components=100, n_iter=50, n_oversamples=20)
+        # sc.pp.neighbors(atac, use_rep="X_lsi", metric="cosine")
+        sc.pp.neighbors(atac, n_pcs=100, metric="cosine")
+        sc.tl.umap(atac)
+        fig = sc.pl.umap(atac, color=["celltype", "batch"], return_fig=True, wspace=0.6)
+        fig.tight_layout()
+        fig.savefig(f"{plot_dir}/atac_umap.png")
+        plt.close()
+
+
     if use_2d_rep:
         base_hic_filename = f"hic_base_{resolution}_2d.h5ad"
     else:
@@ -784,6 +817,7 @@ def preprocess_higlue(args, glue_args):
     peaks = scglue.genomics.Bed(diagonal_anchors.assign(name=hic.var_names[diagonal_mask]))
     tss = genes.strand_specific_start_site()
     promoters = tss.expand(2000, 0)
+    atac_peaks = scglue.genomics.Bed(atac_peaks.assign(name=atac_peaks['name']))
 
     
 
@@ -809,6 +843,16 @@ def preprocess_higlue(args, glue_args):
     )
     overlap_graph = nx.DiGraph(overlap_graph)
     print('Overlap #edges:', overlap_graph.number_of_edges())
+    if atac_file is not None:
+        atac_overlap_graph = scglue.genomics.window_graph(
+            promoters, atac_peaks, 0,
+            attr_fn=lambda l, r, d: {
+                "weight": 1.0,
+                "type": "overlap",
+                "sign": sign_map(r.name)
+            }
+        )
+        print('ATAC graph:', atac_overlap_graph)
 
     dist_graph = scglue.genomics.window_graph(
         promoters, peaks, 150000,
@@ -900,8 +944,14 @@ def preprocess_higlue(args, glue_args):
     if not use_compartment_signs:
         nx.set_edge_attributes(o_prior, 1, "sign")
     nx.set_edge_attributes(o_prior, 0.0, "dist")
-
     o_prior = o_prior.subgraph(hvg_reachable)
+    if atac_file is not None:
+        atac_o_prior = atac_overlap_graph.copy()
+        hvg_reachable = scglue.graph.reachable_vertices(atac_o_prior, rna.var.query("highly_variable").index)
+        atac_o_prior = scglue.graph.compose_multigraph(atac_o_prior, atac_o_prior.reverse())
+        for item in itertools.chain(atac.var_names):
+            atac_o_prior.add_edge(item, item, weight=1.0, type="self-loop", sign=1)
+    atac_o_prior = atac_o_prior.subgraph(hvg_reachable)
 
     d_prior = dist_graph.copy()
 
@@ -935,10 +985,16 @@ def preprocess_higlue(args, glue_args):
         print('Composing coexpression network with Hi-C graph...')
         dcq_prior = scglue.graph.compose_multigraph(dcq_prior, coexpression_graph)
         print(dcq_prior)
+    if atac_file is not None:
+        print('Composing ATAC overlap graph with Hi-C graph...')
+        dcq_prior = scglue.graph.compose_multigraph(dcq_prior, atac_o_prior)
 
     hvg_reachable = scglue.graph.reachable_vertices(dcq_prior, rna.var.query("highly_variable").index)
-
     hic.var["dcq_highly_variable"] = [item in hvg_reachable for item in hic.var_names]
+    if atac_file is not None:
+        atac_reachable = scglue.graph.reachable_vertices(dcq_prior, rna.var.query("highly_variable").index)
+        atac.var["highly_variable"] = [item in atac_reachable for item in atac.var_names]
+        print('ATAC variable Hi-C features', atac.var["highly_variable"].sum())
     keep_distal_mask = hic.var_names.map(lambda s: s[-2] == '-' or s[-3] == '-')
     # set distal entries as highly variable too
     hic.var["dcq_highly_variable"] = hic.var["dcq_highly_variable"] | keep_distal_mask  
@@ -979,21 +1035,26 @@ def preprocess_higlue(args, glue_args):
             row = frags.loc[n]
             strata_attr[n] = 0.0
         else:
-            type_attr[n] = 'Hi-C'
-            chr_split = str(n).split(':')
-            row = {}
-            row['chrom'] = str(chr_split[0])
-            try:
-                pos = chr_split[1].split('-')
-                row['chromStart'] = int(pos[0])
-            except Exception as e:
-                print(n, chr_split, pos, e)
-                row['chromStart'] = 0
-            try:
-                strata_attr[n] = int(str(n).split('-')[-1])
-            except Exception as e:
-                print(e)
-                strata_attr[n] = 0
+            if atac_file is not None and n in atac.var_names:
+                type_attr[n] = 'ATAC'
+                row = atac_peaks.loc[n]
+                strata_attr[n] = 0.0
+            else:
+                type_attr[n] = 'Hi-C'
+                chr_split = str(n).split(':')
+                row = {}
+                row['chrom'] = str(chr_split[0])
+                try:
+                    pos = chr_split[1].split('-')
+                    row['chromStart'] = int(pos[0])
+                except Exception as e:
+                    print(n, chr_split, pos, e)
+                    row['chromStart'] = 0
+                try:
+                    strata_attr[n] = int(str(n).split('-')[-1])
+                except Exception as e:
+                    print(e)
+                    strata_attr[n] = 0
         chrom_attr[n] = str(row['chrom'])
         pos_attr[n] = int(row['chromStart'])
 
@@ -1016,10 +1077,13 @@ def preprocess_higlue(args, glue_args):
     print(suffix)
     os.makedirs(os.path.join(out_dir, 'rna'), exist_ok=True)
     os.makedirs(os.path.join(out_dir, 'hic'), exist_ok=True)
+    os.makedirs(os.path.join(out_dir, 'atac'), exist_ok=True)
     os.makedirs(os.path.join(out_dir, 'graphs'), exist_ok=True)
 
     hic.write(f"{out_dir}/hic/hic_{resolution}_{suffix}.h5ad", compression="gzip")
     rna.write(f"{out_dir}/rna/rna_{resolution}_{suffix}.h5ad", compression="gzip")
+    if atac_file is not None:
+        atac.write(f"{out_dir}/atac/atac_{resolution}_{suffix}.h5ad", compression="gzip")
 
     nx.set_node_attributes(dcq_prior, chrom_attr, "chrom")
     nx.set_node_attributes(dcq_prior, pos_attr, "chrom_pos")

@@ -59,6 +59,7 @@ if __name__ == '__main__':
 
     # SCORE args
     glue_parser.add_argument('--rna_file', type=str, default=None)
+    glue_parser.add_argument('--atac_file', type=str, default=None)
     glue_parser.add_argument('--gtf', type=str, default=None)
     glue_parser.add_argument('--dset', type=str, default=None)
     glue_parser.add_argument('--subname', type=str, default=None)
@@ -149,6 +150,7 @@ if __name__ == '__main__':
     cache_checkpoint = args.cache_checkpoint
     min_confidence = 0.4
     snapatac_init = args.snapatac_init
+    atac_file = args.atac_file
 
     if args.preprocess:
         preprocess_higlue(args, glue_args)
@@ -157,7 +159,8 @@ if __name__ == '__main__':
         
         prior = nx.read_graphml(f"{out_dir}/graphs/{graph_file_suffix}.graphml.gz") 
         rna = ad.read_h5ad(f"{out_dir}/rna/rna_{full_file_suffix}.h5ad")
-        
+        if atac_file is not None:
+            atac = ad.read_h5ad(f"{out_dir}/atac/atac_{full_file_suffix}.h5ad")
         hic = ad.read_h5ad(f"{out_dir}/hic/hic_{full_file_suffix}.h5ad")
         try:
             hic.obs.loc[hic.obs_names.str.startswith('alpha_'), 'celltype'] = 'Alpha'
@@ -175,6 +178,9 @@ if __name__ == '__main__':
         # set depth as fraction of total counts
         rna.obs['depth'] = rna.layers['counts'].sum(axis=1)
         rna.obs['depth'] = rna.obs['depth'] / rna.obs['depth'].max()
+        if atac_file is not None:
+            atac.obs['depth'] = atac.layers['counts'].sum(axis=1)
+            atac.obs['depth'] = atac.obs['depth'] / atac.obs['depth'].max()
         # set hic depth per batch
         for batch in hic.obs['batch'].unique():
             mask = hic.obs['batch'] == batch
@@ -283,6 +289,8 @@ if __name__ == '__main__':
                 color_map[celltype] = colors[-1]
         rna.obs['celltype'] = pd.Categorical(rna.obs['celltype'], categories=rna_celltypes, ordered=True)
         hic.obs['celltype'] = pd.Categorical(hic.obs['celltype'], categories=celltypes, ordered=True)
+        if atac_file is not None:
+            atac.obs['celltype'] = pd.Categorical(atac.obs['celltype'], categories=celltypes, ordered=True)
 
         if use_wandb:
             import wandb
@@ -325,11 +333,19 @@ if __name__ == '__main__':
                                         use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None)
         scglue.models.configure_dataset(hic, "HiCZINB", use_highly_variable=True, use_layer="counts", use_rep="X_lsi" if snapatac_init else None,
                                         use_depth="depth" if depth_correction else None, use_batch="batch")
+        if atac_file is not None:
+            scglue.models.configure_dataset(atac, "NB", use_highly_variable=True, use_layer="counts",
+                                        use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None)
 
         print(f"Total nodes in prior: {len(prior.nodes)}")
-
+        if atac_file is not None:
+            dataset_dict = {"rna": rna, "hic": hic, "atac": atac}
+            modality_weights = {'rna': 1.0, 'hic': hic_weight, 'atac': 1.0}
+        else:
+            dataset_dict = {"rna": rna, "hic": hic}
+            modality_weights = {'rna': 1.0, 'hic': hic_weight}
         glue = scglue.models.fit_SCGLUE(
-            {"rna": rna, "hic": hic}, prior,
+            dataset_dict, prior,
             log_wandb=use_wandb,
             init_kws={"latent_dim": latent_dim, 
                     "use_multi_strata_graph_encoder": multi_strata_graph_encoder, 
@@ -344,13 +360,14 @@ if __name__ == '__main__':
                         "lam_graph": lam_graph,
                         "normalize_u": normalize_u,
                         "lr": lr,
-                        "modality_weight": {'rna': 1.0, 'hic': hic_weight}},
+                        "modality_weight": modality_weights},
             balance_kws={"resolution": 1.0},
             fit_kws={"directory": "glue", 
                     "neg_samples": neg_samples,
                     "val_split": 0.05,
                     "data_batch_size": batch_size,
                     "max_epochs": max_epochs,
+                    "save_interval": 10,
                     "wait_n_lrs": wait_n_lrs}
         )
 
@@ -362,6 +379,10 @@ if __name__ == '__main__':
         # embed and visualize
         rna.obsm["X_glue"] = glue.encode_data("rna", rna)
         hic.obsm["X_glue"] = glue.encode_data("hic", hic)
+        if atac_file is not None:
+            atac.obsm["X_glue"] = glue.encode_data("atac", atac)
+            atac.obs['domain'] = 'atac'
+            atac.obs['old_celltype'] = atac.obs['celltype']
 
         rna.obs['domain'] = 'rna'
         hic.obs['domain'] = 'hic'
@@ -430,8 +451,11 @@ if __name__ == '__main__':
         except Exception as e:
             print(e)
             pass
-
-        combined = ad.concat([rna, hic])
+        
+        if atac_file is not None:
+            combined = ad.concat([rna, hic, atac])
+        else:
+            combined = ad.concat([rna, hic])
 
         sc.pp.neighbors(hic, use_rep="X_glue", metric="cosine", n_neighbors=n_neighbors)
         sc.tl.umap(hic)
