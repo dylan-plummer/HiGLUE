@@ -599,7 +599,7 @@ def preprocess_higlue(args, glue_args):
         
         sc.pp.filter_genes(atac, min_counts=2)
         print(atac.var_names)
-        sc.pp.highly_variable_genes(atac, n_top_genes=n_genes, flavor="seurat_v3")
+        sc.pp.highly_variable_genes(atac, n_top_genes=len(frags), flavor="seurat_v3")
         sc.pp.normalize_total(atac)
         sc.pp.log1p(atac)
         sc.pp.scale(atac)
@@ -607,12 +607,12 @@ def preprocess_higlue(args, glue_args):
         # compute lsi
         # scglue.data.lsi(atac, n_components=100, n_iter=50, n_oversamples=20)
         # sc.pp.neighbors(atac, use_rep="X_lsi", metric="cosine")
-        sc.pp.neighbors(atac, n_pcs=100, metric="cosine")
-        sc.tl.umap(atac)
-        fig = sc.pl.umap(atac, color=["celltype", "batch"], return_fig=True, wspace=0.6)
-        fig.tight_layout()
-        fig.savefig(f"{plot_dir}/atac_umap.png")
-        plt.close()
+        # sc.pp.neighbors(atac, n_pcs=100, metric="cosine")
+        # sc.tl.umap(atac)
+        # fig = sc.pl.umap(atac, color=["celltype", "batch"], return_fig=True, wspace=0.6)
+        # fig.tight_layout()
+        # fig.savefig(f"{plot_dir}/atac_umap.png")
+        # plt.close()
 
 
     if use_2d_rep:
@@ -817,7 +817,8 @@ def preprocess_higlue(args, glue_args):
     peaks = scglue.genomics.Bed(diagonal_anchors.assign(name=hic.var_names[diagonal_mask]))
     tss = genes.strand_specific_start_site()
     promoters = tss.expand(2000, 0)
-    atac_peaks = scglue.genomics.Bed(atac_peaks.assign(name=atac_peaks['name']))
+    if atac_file is not None:
+        atac_peaks = scglue.genomics.Bed(atac_peaks.assign(name=atac_peaks['name']))
 
     
 
@@ -852,7 +853,16 @@ def preprocess_higlue(args, glue_args):
                 "sign": sign_map(r.name)
             }
         )
+        atac_hic_overlap_graph = scglue.genomics.window_graph(
+            atac_peaks, peaks, 0,
+            attr_fn=lambda l, r, d: {
+                "weight": 1.0,
+                "type": "overlap",
+                "sign": sign_map(r.name)
+            }
+        )
         print('ATAC graph:', atac_overlap_graph)
+        print('ATAC-HiC graph:', atac_hic_overlap_graph)
 
     dist_graph = scglue.genomics.window_graph(
         promoters, peaks, 150000,
@@ -947,11 +957,21 @@ def preprocess_higlue(args, glue_args):
     o_prior = o_prior.subgraph(hvg_reachable)
     if atac_file is not None:
         atac_o_prior = atac_overlap_graph.copy()
-        hvg_reachable = scglue.graph.reachable_vertices(atac_o_prior, rna.var.query("highly_variable").index)
+        atac_hic_o_prior = atac_hic_overlap_graph.copy()
+        #hic_gene_graph = scglue.graph.compose_multigraph(o_prior, pchic_graph)
+        #atac_hic_gene_graph = scglue.graph.compose_multigraph(atac_o_prior, hic_gene_graph)
+        #hvg_reachable = scglue.graph.reachable_vertices(atac_hic_gene_graph, rna.var.query("highly_variable").index)
         atac_o_prior = scglue.graph.compose_multigraph(atac_o_prior, atac_o_prior.reverse())
+        atac_hic_o_prior = scglue.graph.compose_multigraph(atac_hic_o_prior, atac_hic_o_prior.reverse())
+        atac_hic_o_prior = scglue.graph.compose_multigraph(atac_o_prior, atac_hic_o_prior)
+        #atac_hic_o_prior = scglue.graph.compose_multigraph(atac_o_prior, pchic_graph)
         for item in itertools.chain(atac.var_names):
             atac_o_prior.add_edge(item, item, weight=1.0, type="self-loop", sign=1)
-    atac_o_prior = atac_o_prior.subgraph(hvg_reachable)
+        atac_reachable = scglue.graph.reachable_vertices(atac_hic_o_prior, rna.var.query("highly_variable").index)
+        atac.var["highly_variable"] = [item in atac_reachable for item in atac.var_names]
+        atac_o_prior = atac_o_prior.subgraph(atac_reachable)
+        #atac_o_prior = atac_hic_o_prior.subgraph(atac_reachable)
+        print(atac_o_prior)
 
     d_prior = dist_graph.copy()
 

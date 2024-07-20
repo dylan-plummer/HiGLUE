@@ -487,8 +487,11 @@ if __name__ == '__main__':
             wandb.log({"joint_umap_rna": wandb.Image('glue_joint_umap_rna.png')})
 
         rna_mask = combined.obs['domain'] == 'rna'
+        
         combined.obs['old_celltype'] = combined.obs['old_celltype'].astype(str)
+        combined.obs['celltype'] = combined.obs['celltype'].astype(str)
         combined.obs.loc[rna_mask, 'old_celltype'] += '_rna'
+        combined.obs.loc[rna_mask, 'celltype'] += '_rna'
         
         rna_color_map = {celltype + '_rna': colors[i] for i, celltype in enumerate(celltypes)}
         # add any missing celltypes from RNA
@@ -496,6 +499,16 @@ if __name__ == '__main__':
         for celltype in rna_celltypes:
             if celltype not in celltypes:
                 rna_color_map[celltype + '_rna'] = colors[-1]
+        if atac_file is not None:
+            atac_mask = combined.obs['domain'] == 'atac'
+            combined.obs.loc[atac_mask, 'old_celltype'] += '_atac'
+            combined.obs.loc[atac_mask, 'celltype'] += '_atac'
+            atac_color_map = {celltype + '_atac': colors[i] for i, celltype in enumerate(celltypes)}
+            atac_celltypes = atac.obs['celltype'].unique()
+            for celltype in atac_celltypes:
+                if celltype not in celltypes:
+                    atac_color_map[celltype + '_atac'] = colors[-1]
+            rna_color_map = {**rna_color_map, **atac_color_map}
         color_map = {**color_map, **rna_color_map}
         color_map['Other'] = 'gray'
         fig = sc.pl.umap(combined, color=["old_celltype"], groups=celltypes, palette=color_map, size=100, wspace=0.45, return_fig=True)
@@ -503,6 +516,18 @@ if __name__ == '__main__':
         plt.close()
         if use_wandb:
             wandb.log({"joint_umap_separate": wandb.Image('glue_joint_umap_separate.png')})
+
+        if atac_file is not None:
+            try:
+                atac_celltypes = [c + '_atac' for c in celltypes]
+                fig = sc.pl.umap(combined, color=["old_celltype"], groups=atac_celltypes, palette=color_map, size=100, wspace=0.45, return_fig=True)
+                fig.savefig('glue_joint_umap_separate_atac.png')
+                plt.close()
+                if use_wandb:
+                    wandb.log({"joint_umap_separate_atac": wandb.Image('glue_joint_umap_separate_atac.png')})
+            except Exception as e:
+                print(e)
+        
 
         # save combined data
         os.makedirs(f"{out_dir}/combined_embedding", exist_ok=True)
@@ -534,42 +559,62 @@ if __name__ == '__main__':
             if use_wandb:
                 wandb.log({"val_accuracy_filtered": val_accuracy, "val_ari_filtered": val_ari})
 
-        # try to save tmp vizualizations as animated gifs
-        # try:
-        #     import imageio
-        #     frame_duration = 0.2
-        #     pca_dir = 'tmp_imgs/pca'
-        #     with imageio.get_writer('pca.gif', mode='I', duration=frame_duration, loop=0) as writer:
-        #         pretrain_files = [f for f in sorted_nicely(os.listdir(pca_dir)) if 'pretrain' in f]
-        #         finetune_files = [f for f in sorted_nicely(os.listdir(pca_dir)) if 'finetune' in f]
-        #         for filename in pretrain_files + finetune_files + [finetune_files[-1]] * 20:
-        #             filepath = os.path.join(pca_dir, filename)
-        #             image = imageio.imread(filepath)
-        #             writer.append_data(image)
-        #         for filename in pretrain_files + finetune_files:
-        #             try:
-        #                 os.remove(filepath)
-        #             except Exception:
-        #                 pass
-        #     if use_wandb:
-        #         wandb.log({"pca_gif": wandb.Image('pca.gif')})
-        #     umap_dir = 'tmp_imgs/umap'
-        #     with imageio.get_writer('umap.gif', mode='I', duration=frame_duration, loop=0) as writer:
-        #         pretrain_files = [f for f in sorted_nicely(os.listdir(umap_dir)) if 'pretrain' in f]
-        #         finetune_files = [f for f in sorted_nicely(os.listdir(umap_dir)) if 'finetune' in f]
-        #         for filename in pretrain_files + finetune_files + [finetune_files[-1]] * 20:
-        #             filepath = os.path.join(umap_dir, filename)
-        #             image = imageio.imread(filepath)
-        #             writer.append_data(image)
-        #         for filename in pretrain_files + finetune_files:
-        #             try:
-        #                 os.remove(filepath)
-        #             except Exception:
-        #                 pass
-        #     if use_wandb:
-        #         wandb.log({"umap_gif": wandb.Image('umap.gif')})
-        # except Exception as e:
-        #     print(e)
+        #try to save tmp vizualizations as animated gifs
+        try:
+            # import imageio
+            # frame_duration = 0.2
+            # pca_dir = 'tmp_imgs/pca'
+            # with imageio.get_writer('pca.gif', mode='I', duration=frame_duration, loop=0) as writer:
+            #     pretrain_files = [f for f in sorted_nicely(os.listdir(pca_dir)) if 'pretrain' in f]
+            #     finetune_files = [f for f in sorted_nicely(os.listdir(pca_dir)) if 'finetune' in f]
+            #     for filename in pretrain_files + finetune_files + [finetune_files[-1]] * 20:
+            #         filepath = os.path.join(pca_dir, filename)
+            #         image = imageio.imread(filepath)
+            #         writer.append_data(image)
+            #     for filename in pretrain_files + finetune_files:
+            #         filepath = os.path.join(pca_dir, filename)
+            #         try:
+            #             os.remove(filepath)
+            #         except Exception:
+            #             pass
+            # if use_wandb:
+            #     wandb.log({"pca_gif": wandb.Image('pca.gif')})
+            # umap_dir = 'tmp_imgs/umap'
+            # with imageio.get_writer('umap.gif', mode='I', duration=frame_duration, loop=0) as writer:
+            #     pretrain_files = [f for f in sorted_nicely(os.listdir(umap_dir)) if 'pretrain' in f]
+            #     finetune_files = [f for f in sorted_nicely(os.listdir(umap_dir)) if 'finetune' in f]
+            #     for filename in pretrain_files + finetune_files + [finetune_files[-1]] * 20:
+            #         filepath = os.path.join(umap_dir, filename)
+            #         image = imageio.imread(filepath)
+            #         writer.append_data(image)
+            #     for filename in pretrain_files + finetune_files:
+            #         filepath = os.path.join(umap_dir, filename)
+            #         try:
+            #             os.remove(filepath)
+            #         except Exception:
+            #             pass
+            # if use_wandb:
+            #     wandb.log({"umap_gif": wandb.Image('umap.gif')})
+            import imageio
+            frame_duration = 0.2
+            pca_dir = 'tmp_imgs/features'
+            with imageio.get_writer('features.gif', mode='I', duration=frame_duration, loop=0) as writer:
+                pretrain_files = [f for f in sorted_nicely(os.listdir(pca_dir)) if 'pretrain' in f]
+                finetune_files = [f for f in sorted_nicely(os.listdir(pca_dir)) if 'finetune' in f]
+                for filename in pretrain_files + finetune_files + [finetune_files[-1]] * 20:
+                    filepath = os.path.join(pca_dir, filename)
+                    image = imageio.imread(filepath)
+                    writer.append_data(image)
+                for filename in pretrain_files + finetune_files:
+                    filepath = os.path.join(pca_dir, filename)
+                    try:
+                        os.remove(filepath)
+                    except Exception:
+                        pass
+            if use_wandb:
+                wandb.log({"features_gif": wandb.Image('features.gif')})
+        except Exception as e:
+            print(e)
 
         if use_wandb:
             wandb.finish()
