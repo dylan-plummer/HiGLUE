@@ -599,7 +599,7 @@ def preprocess_higlue(args, glue_args):
         
         sc.pp.filter_genes(atac, min_counts=2)
         print(atac.var_names)
-        sc.pp.highly_variable_genes(atac, n_top_genes=len(frags), flavor="seurat_v3")
+        sc.pp.highly_variable_genes(atac, n_top_genes=n_genes, flavor="seurat_v3")
         sc.pp.normalize_total(atac)
         sc.pp.log1p(atac)
         sc.pp.scale(atac)
@@ -957,6 +957,7 @@ def preprocess_higlue(args, glue_args):
     o_prior = o_prior.subgraph(hvg_reachable)
     if atac_file is not None:
         atac_o_prior = atac_overlap_graph.copy()
+        atac_reachable = scglue.graph.reachable_vertices(atac_o_prior, rna.var.query("highly_variable").index)
         atac_hic_o_prior = atac_hic_overlap_graph.copy()
         #hic_gene_graph = scglue.graph.compose_multigraph(o_prior, pchic_graph)
         #atac_hic_gene_graph = scglue.graph.compose_multigraph(atac_o_prior, hic_gene_graph)
@@ -967,8 +968,9 @@ def preprocess_higlue(args, glue_args):
         #atac_hic_o_prior = scglue.graph.compose_multigraph(atac_o_prior, pchic_graph)
         for item in itertools.chain(atac.var_names):
             atac_o_prior.add_edge(item, item, weight=1.0, type="self-loop", sign=1)
-        atac_reachable = scglue.graph.reachable_vertices(atac_hic_o_prior, rna.var.query("highly_variable").index)
-        atac.var["highly_variable"] = [item in atac_reachable for item in atac.var_names]
+        #atac_reachable = scglue.graph.reachable_vertices(atac_hic_o_prior, rna.var.query("highly_variable").index)
+        
+        #atac.var["highly_variable"] = [item in atac_reachable for item in atac.var_names]
         atac_o_prior = atac_o_prior.subgraph(atac_reachable)
         #atac_o_prior = atac_hic_o_prior.subgraph(atac_reachable)
         print(atac_o_prior)

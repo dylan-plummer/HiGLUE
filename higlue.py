@@ -78,6 +78,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--lam_align', type=str, default=0.02)
     glue_parser.add_argument('--lam_graph', type=str, default=0.1)
     glue_parser.add_argument('--suffix', type=str, default='2d')
+    glue_parser.add_argument('--save_interval', type=int, default=10)
     glue_parser.add_argument('--latent_dim', type=int, default=64)
     glue_parser.add_argument('--batch_size', type=int, default=128)
     glue_parser.add_argument('--h_dim', type=int, default=128)
@@ -124,6 +125,7 @@ if __name__ == '__main__':
     lam_align = args.lam_align
     lam_graph = args.lam_graph
     suffix = args.suffix
+    save_interval = args.save_interval
     latent_dim = args.latent_dim
     batch_size = args.batch_size
     h_dim = args.h_dim
@@ -367,7 +369,7 @@ if __name__ == '__main__':
                     "val_split": 0.05,
                     "data_batch_size": batch_size,
                     "max_epochs": max_epochs,
-                    "save_interval": 10,
+                    "save_interval": save_interval,
                     "wait_n_lrs": wait_n_lrs}
         )
 
@@ -511,7 +513,7 @@ if __name__ == '__main__':
             rna_color_map = {**rna_color_map, **atac_color_map}
         color_map = {**color_map, **rna_color_map}
         color_map['Other'] = 'gray'
-        fig = sc.pl.umap(combined, color=["old_celltype"], groups=celltypes, palette=color_map, size=100, wspace=0.45, return_fig=True)
+        fig = sc.pl.umap(combined, color=["celltype" if 'islet' in dataset_name else 'old_celltype'], groups=celltypes, palette=color_map, size=100, wspace=0.45, return_fig=True)
         fig.savefig('glue_joint_umap_separate.png')
         plt.close()
         if use_wandb:
