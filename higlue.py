@@ -39,7 +39,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--preprocess', action='store_true')
     glue_parser.add_argument('--train', action='store_true')
     glue_parser.add_argument('--offset', type=int, default=0)
-    glue_parser.add_argument('--min_count', type=int, default=3)
+    glue_parser.add_argument('--min_count', type=int, default=0)
     glue_parser.add_argument('--distal_interactions', type=int, default=None)
     glue_parser.add_argument('--filter_strata', type=float, default=None)
     glue_parser.add_argument('--exclusive_strata', action='store_true')
@@ -56,6 +56,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--coexpression_edges', type=int, default=10000)
     glue_parser.add_argument('--cis_coexpression', action='store_true')
     glue_parser.add_argument('--snapatac_init', action='store_true')
+    glue_parser.add_argument('--init_embedding', type=str, default=None)
 
     # SCORE args
     glue_parser.add_argument('--rna_file', type=str, default=None)
@@ -75,8 +76,9 @@ if __name__ == '__main__':
     glue_parser.add_argument('--prior', type=str, default='dcq')
     glue_parser.add_argument('--hic_weight', type=str, default=10.0)
     glue_parser.add_argument('--n_neighbors', type=int, default=15)
-    glue_parser.add_argument('--lam_align', type=str, default=0.02)
+    glue_parser.add_argument('--lam_align', type=str, default=0.01)
     glue_parser.add_argument('--lam_graph', type=str, default=0.1)
+    glue_parser.add_argument('--lam_cycle', type=str, default=0.02)
     glue_parser.add_argument('--suffix', type=str, default='2d')
     glue_parser.add_argument('--save_interval', type=int, default=10)
     glue_parser.add_argument('--latent_dim', type=int, default=64)
@@ -96,6 +98,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--binarize', action='store_true')
     glue_parser.add_argument('--use_batch', type=str, default=None)
     glue_parser.add_argument('--use_rna_counts', action='store_true')
+    glue_parser.add_argument('--use_atac_counts', action='store_true')
     glue_parser.add_argument('--cache_checkpoint', type=str, default=None)
 
     glue_args = sys.argv.index('SCORE')
@@ -124,6 +127,7 @@ if __name__ == '__main__':
     n_neighbors = args.n_neighbors
     lam_align = args.lam_align
     lam_graph = args.lam_graph
+    lam_cycle = args.lam_cycle
     suffix = args.suffix
     save_interval = args.save_interval
     latent_dim = args.latent_dim
@@ -148,10 +152,12 @@ if __name__ == '__main__':
     binarize = args.binarize
     use_wandb = args.wandb
     use_rna_pca = not args.use_rna_counts
+    use_atac_pca = not args.use_atac_counts
     use_batch = args.use_batch
     cache_checkpoint = args.cache_checkpoint
     min_confidence = 0.4
     snapatac_init = args.snapatac_init
+    init_embedding = args.init_embedding
     atac_file = args.atac_file
 
     if args.preprocess:
@@ -196,7 +202,7 @@ if __name__ == '__main__':
             hic.layers['counts_pre_binarize'] = hic.layers['counts'].copy()
             hic.layers['counts'] = hic.X.copy()
 
-        celltypes = hic.obs['celltype'].unique()
+        celltypes = list(hic.obs['celltype'].unique())
         n_clusters = len(celltypes)
         colors = list(plt.cm.tab20(np.int32(np.linspace(0, n_clusters + 0.99, n_clusters))))
         color_map = {celltype: colors[i] for i, celltype in enumerate(celltypes)}
@@ -240,7 +246,7 @@ if __name__ == '__main__':
             color_map = {celltype: [c / 255.0 for c in color] for celltype, color in color_map.items()}
             color_map['Neu'] = 'gray'
             color_map['Neu_rna'] = 'gray'
-
+            colors = list(color_map.values())
             rna.obs['celltype'] = rna.obs['celltype'].map(rna_celltype_map)
         elif 'human_brain' in dataset_name:
             neurons_rna_celltypes = ['IN-PV', 'IN-SST', 'IN-VIP', 'IN-SV2C', 'Neu-mat',
@@ -292,13 +298,15 @@ if __name__ == '__main__':
         rna.obs['celltype'] = pd.Categorical(rna.obs['celltype'], categories=rna_celltypes, ordered=True)
         hic.obs['celltype'] = pd.Categorical(hic.obs['celltype'], categories=celltypes, ordered=True)
         if atac_file is not None:
-            atac.obs['celltype'] = pd.Categorical(atac.obs['celltype'], categories=celltypes, ordered=True)
+            atac_celltypes = atac.obs['celltype'].unique()
+            atac.obs['celltype'] = pd.Categorical(atac.obs['celltype'], categories=atac_celltypes, ordered=True)
 
         if use_wandb:
             import wandb
             wandb.init(project=f'GLUE-{dataset_name}-hic-2d-prior', 
                     sync_tensorboard=True, 
                     config={'prior': prior_name, 
+                            'rna_file': args.rna_file,
                             'res': resolution,
                             'hic_type': hic_type,
                             'loop_q': loop_q,
@@ -321,6 +329,7 @@ if __name__ == '__main__':
                             'shifted_additive': shifted_additive,
                             'use_activation': use_activation,
                             'use_attn': use_attn,
+                            'distances_normalized': args.use_dist_norm,
                             'binarize': binarize,
                             'multi_strata_graph_encoder': multi_strata_graph_encoder,
                             'coexpression_network': args.coexpression_network,
@@ -333,10 +342,10 @@ if __name__ == '__main__':
 
         scglue.models.configure_dataset(rna, "NB", use_highly_variable=True, use_layer="counts", use_rep="X_pca" if use_rna_pca else None,
                                         use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None)
-        scglue.models.configure_dataset(hic, "HiCZINB", use_highly_variable=True, use_layer="counts", use_rep="X_lsi" if snapatac_init else None,
+        scglue.models.configure_dataset(hic, "HiCZINB", use_highly_variable=True, use_layer="counts", use_rep="X_lsi" if (snapatac_init or init_embedding is not None) else None,
                                         use_depth="depth" if depth_correction else None, use_batch="batch")
         if atac_file is not None:
-            scglue.models.configure_dataset(atac, "NB", use_highly_variable=True, use_layer="counts",
+            scglue.models.configure_dataset(atac, "NB", use_highly_variable=True, use_layer="counts", 
                                         use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None)
 
         print(f"Total nodes in prior: {len(prior.nodes)}")
@@ -350,7 +359,7 @@ if __name__ == '__main__':
             dataset_dict, prior,
             log_wandb=use_wandb,
             init_kws={"latent_dim": latent_dim, 
-                    "use_multi_strata_graph_encoder": multi_strata_graph_encoder, 
+                    #"use_distance_specific_graph": True, 
                     "shifted_additive": shifted_additive,
                     "use_activation": use_activation,
                     "use_attn": use_attn,
@@ -360,6 +369,7 @@ if __name__ == '__main__':
                     "n_strata": n_strata},
             compile_kws={"lam_align": lam_align, 
                         "lam_graph": lam_graph,
+                        "lam_cycle": lam_cycle,
                         "normalize_u": normalize_u,
                         "lr": lr,
                         "modality_weight": modality_weights},
@@ -437,9 +447,29 @@ if __name__ == '__main__':
                 wandb.log({"rna_accuracy": rna_accuracy, 
                         "rna_ari": rna_ari,
                         "rna_silhouette_score": rna_sil_score})
+                
+            # if atac file is provided, do the same for atac
+            if atac_file is not None:
+                try:
+                    scglue.data.transfer_labels(rna, atac, "celltype", use_rep="X_glue", n_neighbors=n_neighbors)
+                    atac_celltypes = atac.obs['old_celltype'].unique()
+                    atac_celltype_map = {c: i for i, c in enumerate(atac_celltypes)}
+                    atac.obs['old_celltype_int'] = atac.obs['old_celltype'].map(atac_celltype_map)
+                    atac.obs['celltype_int'] = atac.obs['celltype'].map(atac_celltype_map)
+                    # replace NaNs with the last index
+                    atac.obs['celltype_int'].fillna(len(atac_celltypes), inplace=True)
+                    atac_accuracy = accuracy_score(atac.obs['old_celltype_int'], atac.obs['celltype_int'])
+                    atac_ari = adjusted_rand_score(atac.obs['old_celltype_int'], atac.obs['celltype_int'])
+                    atac_sil_score = silhouette_score(atac.obsm['X_glue'], atac.obs['celltype_int'])
+                    if use_wandb:
+                        wandb.log({"atac_accuracy": atac_accuracy, 
+                                "atac_ari": atac_ari,
+                                "atac_silhouette_score": atac_sil_score})
+                except Exception as e:
+                    print(e)
 
             # remove low confidence cells
-            hic = hic[hic.obs['celltype_confidence'] > min_confidence, :].copy()
+            #hic = hic[hic.obs['celltype_confidence'] > min_confidence, :].copy()
             #hic = hic[hic.obs['depth'] > min_depth, :]
 
             # compute filtered accuracy
@@ -476,6 +506,28 @@ if __name__ == '__main__':
         if use_wandb:
             wandb.log({"joint_umap": wandb.Image('glue_joint_umap.png')})
 
+        if cache_checkpoint:
+            # save the cell type predictions and cell coordinates
+            pred_checkpoint = f"{cache_checkpoint}_predictions"
+            os.makedirs(pred_checkpoint, exist_ok=True)
+            n_checkpoints = len(os.listdir(pred_checkpoint))
+            combined_hic_only = combined[combined.obs['domain'] == 'hic']
+            neighbors_list = [5, 10, 15, 20, 50, 100]
+            df = {'cell': list(hic.obs_names), 'old_celltype': list(hic.obs['old_celltype']), 
+                  'combined_umap_1': list(combined_hic_only.obsm['X_umap'][:, 0]),
+                  'combined_umap_2': list(combined_hic_only.obsm['X_umap'][:, 1])}
+            for neighbors in neighbors_list:
+                scglue.data.transfer_labels(rna, hic, "celltype", use_rep="X_glue", n_neighbors=neighbors)
+                df[f'celltype_{neighbors}'] = list(hic.obs['celltype'])
+            df = pd.DataFrame(df)
+            df['resolution'] = resolution
+            df['n_genes'] = n_genes
+            df['n_strata'] = n_strata
+            df['filter_strata'] = filter_strata
+            df['loop_q'] = loop_q
+            df.to_csv(f"{pred_checkpoint}/celltype_prediction_{n_checkpoints}.csv", index=False)
+            print(df)
+
         fig = sc.pl.umap(combined[combined.obs["domain"] == "hic"], color=["old_celltype", "celltype"], palette=color_map, wspace=0.45, return_fig=True)
         fig.savefig('glue_joint_umap_hic.png')
         plt.close()
@@ -503,26 +555,45 @@ if __name__ == '__main__':
                 rna_color_map[celltype + '_rna'] = colors[-1]
         if atac_file is not None:
             atac_mask = combined.obs['domain'] == 'atac'
+            atac_celltypes = atac.obs['celltype'].unique()
+            print(atac_celltypes)
             combined.obs.loc[atac_mask, 'old_celltype'] += '_atac'
             combined.obs.loc[atac_mask, 'celltype'] += '_atac'
             atac_color_map = {celltype + '_atac': colors[i] for i, celltype in enumerate(celltypes)}
-            atac_celltypes = atac.obs['celltype'].unique()
             for celltype in atac_celltypes:
                 if celltype not in celltypes:
-                    atac_color_map[celltype + '_atac'] = colors[-1]
+                    atac_color_map[str(celltype) + '_atac'] = colors[-1]
             rna_color_map = {**rna_color_map, **atac_color_map}
         color_map = {**color_map, **rna_color_map}
         color_map['Other'] = 'gray'
-        fig = sc.pl.umap(combined, color=["celltype" if 'islet' in dataset_name else 'old_celltype'], groups=celltypes, palette=color_map, size=100, wspace=0.45, return_fig=True)
-        fig.savefig('glue_joint_umap_separate.png')
-        plt.close()
-        if use_wandb:
-            wandb.log({"joint_umap_separate": wandb.Image('glue_joint_umap_separate.png')})
+        
+        try:
+            fig = sc.pl.umap(combined, color=["celltype" if 'islet' in dataset_name else 'old_celltype'], groups=celltypes, palette=color_map, size=100, wspace=0.45, return_fig=True)
+            fig.savefig('glue_joint_umap_separate.png')
+            plt.close()
+            if use_wandb:
+                wandb.log({"joint_umap_separate": wandb.Image('glue_joint_umap_separate.png')})
+        except Exception as e:
+            print(e)
+            pass
 
         if atac_file is not None:
             try:
-                atac_celltypes = [c + '_atac' for c in celltypes]
-                fig = sc.pl.umap(combined, color=["old_celltype"], groups=atac_celltypes, palette=color_map, size=100, wspace=0.45, return_fig=True)
+                fig = sc.pl.umap(combined[combined.obs["domain"] == "atac"], color=["old_celltype"], wspace=0.45, return_fig=True)
+                fig.savefig('glue_joint_umap_atac.png')
+                plt.close()
+                if use_wandb:
+                    wandb.log({"joint_umap_atac": wandb.Image('glue_joint_umap_atac.png')})
+            except Exception as e:
+                print(e)
+                pass
+            try:
+                atac_celltypes = [c + '_atac' for c in atac_celltypes]
+                if 'islet' in dataset_name or 'pfc' in dataset_name:  # paired celltype names
+                    atac_color_map = color_map
+                else:
+                    atac_color_map = sc.pl.palettes.godsnot_102
+                fig = sc.pl.umap(combined, color=["old_celltype", "celltype"], groups=atac_celltypes, palette=atac_color_map, size=100, wspace=0.65, return_fig=True)
                 fig.savefig('glue_joint_umap_separate_atac.png')
                 plt.close()
                 if use_wandb:

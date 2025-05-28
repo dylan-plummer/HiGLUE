@@ -22,7 +22,22 @@ from scipy.sparse import coo_matrix, csr_matrix
 from networkx.algorithms.bipartite import biadjacency_matrix
 from score.sc_args import parse_args
 from score.utils.utils import anchor_to_locus, anchor_list_to_dict, sorted_nicely
-from score.utils.matrix_ops import OE_norm
+from score.utils.matrix_ops import VC_SQRT_norm
+
+def OE_norm(mat, max_strata=100):
+    new_mat = mat.copy() / np.max(mat)  # unchanged values guaranteed to be <=1
+    #averages = np.array([np.mean(mat[i:, :len(mat) - i]) for i in range(min(max_strata, len(mat)))])
+    averages = np.array([np.mean(np.diagonal(mat, offset=i)) for i in range(min(max_strata, len(mat)))])
+    averages = np.where(averages == 0, 1, averages)
+    # for i in range(len(mat)):
+    #     for j in range(len(mat)):
+    #         d = abs(i - j)
+    #         if d < max_strata:
+    #             new_mat[i, j] = mat[i, j] / averages[d]
+    # # vectorized version
+    for i in range(min(max_strata, len(mat))):
+        new_mat[i:, :len(mat) - i] = mat[i:, :len(mat) - i] / averages[i]
+    return new_mat
 
 def get_processed_matrix(dataset, cell, cell_i, preprocessing, chr_only=None):
     c = cooler.Cooler(f"{dataset.scool_file}::/cells/{cell}")
@@ -50,7 +65,7 @@ def get_processed_matrix(dataset, cell, cell_i, preprocessing, chr_only=None):
                 matrix = coo_matrix((chr_contacts['obs'], (rows, cols)),
                             shape=(len(chr_anchors), len(chr_anchors)))
                 
-                mat = matrix.A
+                mat = matrix.toarray()
             
             else:
                 mat = np.zeros((len(chr_anchors), len(chr_anchors)))
@@ -88,12 +103,12 @@ def get_flattened_matrices(dataset, n_strata, preprocessing=None, agg_fn=None, c
 
     if agg_fn is not None:  # aggregating to 1D
         print('Aggregating to 1D')
-        strata_mask = np.zeros_like(full_mats[0].A)
+        strata_mask = np.zeros_like(full_mats[0].toarray())
         for k in range(n_strata):
             strata_mask += np.eye(strata_mask.shape[0], k=k, dtype=full_mats[0].dtype)
         mat = []
         for cell_i, cell in enumerate(sorted(dataset.cell_list)):
-            tmp_mat = full_mats[cell_i].A
+            tmp_mat = full_mats[cell_i].toarray()
             tmp_mat[strata_mask == 0] = 0
             mat.append(agg_fn(tmp_mat, axis=0))
     else:  # unraveling 2D strata to 1D vector
@@ -154,6 +169,7 @@ def preprocess_higlue(args, glue_args):
     coexpression_edges = args.coexpression_edges
     cis_coexpression = args.cis_coexpression
     snapatac_init = args.snapatac_init
+    init_embedding = args.init_embedding
     n_loops = 1000000 
     if not use_toploops:
         loop_q = float(loop_q)
@@ -331,7 +347,7 @@ def preprocess_higlue(args, glue_args):
                     loop_cutoff = np.quantile(chr_trans_pixels['rank'].values, q=trans_loop_q)
                     chr_trans_pixels = chr_trans_pixels.loc[chr_trans_pixels['rank'] >= loop_cutoff].copy()
                     chr_trans_pixels['rank'] = chr_trans_pixels['rank'].rank(pct=True)
-                    chr_trans_pixels['rank'] = chr_trans_pixels['rank'] * 0.5 + 0.5
+                    #chr_trans_pixels['rank'] = chr_trans_pixels['rank'] * 0.5 + 0.5
                     print(chr_trans_pixels)
                     trans.append(chr_trans_pixels)
                 except IndexError:  # no reads in chrom (e.g no chrY)
@@ -354,26 +370,44 @@ def preprocess_higlue(args, glue_args):
         loops['rank'] = loops['count'].rank(pct=True)
     loops.dropna(inplace=True)
 
-    # if use_dist_norm:
-    #     # extract each dense matrix and compute OE normalization
-    #     print('OE normalizing Hi-C data...')
-    #     oe_loops = []
-    #     for chr_name in tqdm(sorted_nicely(bulk.chromnames)):
-    #         chr_mat = bulk.matrix(balance=use_ice).fetch(chr_name)
-    #         chr_mat = OE_norm(chr_mat.A)
-    #         chr_mat = csr_matrix(chr_mat)
-    #         chr_anchors = frags[frags['chrom'] == chr_name].copy()
-    #         chr_anchors.reset_index(drop=True, inplace=True)
-    #         chr_anchor_dict = anchor_list_to_dict(chr_anchors['name'].values)
-    #         rows = np.vectorize(anchor_to_locus(chr_anchor_dict))(loops.loc[loops['chr1'] == chr_name, 'bin1_id'].values)
-    #         cols = np.vectorize(anchor_to_locus(chr_anchor_dict))(loops.loc[loops['chr2'] == chr_name, 'bin2_id'].values)
-    #         oe_values = chr_mat[rows, cols]
-    #         chr_loops = loops.loc[(loops['chr1'] == chr_name) & (loops['chr2'] == chr_name)].copy()
-    #         chr_loops['oe'] = oe_values
-    #         oe_loops.append(chr_loops)
-    #     loops = pd.concat(oe_loops).reset_index(drop=True)
-    #     loops['rank'] = loops['oe'].rank(pct=True)
-    #     print(loops)
+    if use_dist_norm:
+        # extract each dense matrix and compute OE normalization
+        print('OE normalizing Hi-C data...')
+        oe_loops = []
+        for chr_name in tqdm(sorted_nicely(bulk.chromnames)):
+            if not use_xy and ('x' in chr_name.lower() or 'y' in chr_name.lower()):
+                continue
+            chr_loops = loops[(loops['chr1'] == chr_name) & (loops['chr2'] == chr_name)].copy()
+            chr_anchors = frags[frags['chrom'] == chr_name].copy()
+            chr_offset = chr_anchors.index[0]
+            chr_anchors.reset_index(drop=True, inplace=True)
+            
+            # convert to dense matrix
+            if use_ice:
+                val_col = 'oe'
+            else:
+                val_col = 'count'
+            chr_mat = csr_matrix((chr_loops[val_col].values, 
+                                  (chr_loops['bin1_id'].values - chr_offset, chr_loops['bin2_id'].values - chr_offset)), 
+                                  shape=(len(chr_anchors), len(chr_anchors)))
+            # chr_mat = bulk.matrix(balance=use_ice).fetch(chr_name)
+            chr_mat = OE_norm(VC_SQRT_norm(chr_mat.toarray()))
+            chr_mat = csr_matrix(chr_mat)
+            oe_values = chr_mat.data
+            chr_loops['oe'] = oe_values
+            oe_loops.append(chr_loops)
+            if chr_name == 'chr10':  # visualize first matrix
+                mat = chr_mat.toarray()
+                mat = mat + mat.T - np.diag(np.diag(mat))
+                midpoint = mat.shape[0] // 2
+                mat = mat[midpoint - n_strata:midpoint + n_strata, midpoint - n_strata:midpoint + n_strata]
+                plt.imshow(mat, cmap='Reds', norm=LogNorm())
+                plt.colorbar()
+                plt.savefig(f'{plot_dir}/hic_example_oe.png')
+                plt.close()
+        loops = pd.concat(oe_loops).reset_index(drop=True)
+        loops['rank'] = loops['oe'].rank(pct=True)
+        print(loops)
     
     loop_dfs = []
     print('Filtering top loops in each chromosome...')
@@ -386,7 +420,7 @@ def preprocess_higlue(args, glue_args):
         chr_loops = chr_loops.loc[chr_loops['rank'] >= loop_cutoff].copy()
         chr_loops['rank'] = chr_loops['rank'].rank(pct=True)
         # scale rank to (0.5, 1) since the graph decoder uses sigmoid
-        chr_loops['rank'] = chr_loops['rank'] * 0.5 + 0.5
+        #chr_loops['rank'] = chr_loops['rank'] * 0.5 + 0.5
         chr_loops.reset_index(drop=True, inplace=True)
         chr_loops.drop(columns=['chr1', 'chr2'], inplace=True)
         if use_ice:
@@ -530,7 +564,7 @@ def preprocess_higlue(args, glue_args):
     print('Embedding RNA...')
     print('Highly variable genes...')
     
-    sc.pp.highly_variable_genes(rna, n_top_genes=n_genes, flavor="seurat_v3")
+    sc.pp.highly_variable_genes(rna, n_top_genes=n_genes, flavor="seurat_v3", span=1)
     if gene_list is not None:
         for gene in gene_list:
             if gene in rna.var_names:
@@ -573,46 +607,15 @@ def preprocess_higlue(args, glue_args):
     sc.pp.log1p(rna)
     sc.pp.scale(rna)
     print("PCA")
-    sc.tl.pca(rna, n_comps=100, svd_solver="auto")
+    sc.tl.pca(rna, n_comps=200, svd_solver="auto")
     if viz_rna:
-        sc.pp.neighbors(rna, n_pcs=100, metric="cosine")
+        sc.pp.neighbors(rna, n_pcs=200, metric="cosine")
         sc.tl.umap(rna)
 
         fig = sc.pl.umap(rna, color=["celltype", "batch"], return_fig=True, wspace=0.6)
         fig.tight_layout()
         fig.savefig(f"{plot_dir}/rna_umap.png")
         plt.close()
-
-    if atac_file is not None:
-        atac = ad.read_h5ad(atac_file)
-        if 'batch' not in rna.obs.columns:
-            rna.obs['batch'] = 0
-        atac.layers["counts"] = atac.X.copy()
-        atac.var['chrom'] = atac.var_names.map(lambda s: s.split(':')[0])
-        atac.var['chromStart'] = atac.var_names.map(lambda s: s.split(':')[1].split('-')[0]).astype(int)
-        atac.var['chromEnd'] = atac.var_names.map(lambda s: s.split(':')[1].split('-')[1]).astype(int)
-        atac.var['name'] = atac.var_names
-        atac = atac[:, atac.var['chrom'].notna()].copy()
-        # only accept chroms 1-22, X and Y
-        atac = atac[:, atac.var['chrom'].isin([f'chr{i}' for i in range(1, 23)] + ['chrX', 'chrY'])].copy()
-        atac_peaks = scglue.genomics.Bed(atac.var.assign(name=atac.var_names))
-        
-        sc.pp.filter_genes(atac, min_counts=2)
-        print(atac.var_names)
-        sc.pp.highly_variable_genes(atac, n_top_genes=n_genes, flavor="seurat_v3")
-        sc.pp.normalize_total(atac)
-        sc.pp.log1p(atac)
-        sc.pp.scale(atac)
-        sc.tl.pca(atac, n_comps=100, svd_solver="auto")
-        # compute lsi
-        # scglue.data.lsi(atac, n_components=100, n_iter=50, n_oversamples=20)
-        # sc.pp.neighbors(atac, use_rep="X_lsi", metric="cosine")
-        # sc.pp.neighbors(atac, n_pcs=100, metric="cosine")
-        # sc.tl.umap(atac)
-        # fig = sc.pl.umap(atac, color=["celltype", "batch"], return_fig=True, wspace=0.6)
-        # fig.tight_layout()
-        # fig.savefig(f"{plot_dir}/atac_umap.png")
-        # plt.close()
 
 
     if use_2d_rep:
@@ -637,8 +640,8 @@ def preprocess_higlue(args, glue_args):
                 #     strata_mat.append(new_strata)
                 # else:
                 new_strata = list(mats[cell_i].diagonal(k=k))
-                if len(new_strata) < len(frags):
-                    new_strata += [0] * (len(frags) - len(new_strata))
+                if len(new_strata) < len(dataset.anchor_list):
+                    new_strata += [0] * (len(dataset.anchor_list) - len(new_strata))
                 if resolution == '10kb' or resolution == '100kb' or resolution == '50kb':
                     strata_mat.append(np.uint8(new_strata))
                 else:
@@ -740,6 +743,38 @@ def preprocess_higlue(args, glue_args):
     fig.savefig(f'{plot_dir}/pfc_hic_umap_{resolution}.png')
     plt.close() 
 
+    if atac_file is not None:
+        atac = ad.read_h5ad(atac_file)
+        if 'batch' not in rna.obs.columns:
+            rna.obs['batch'] = 0
+        atac.layers["counts"] = atac.X.copy()
+        atac.var['chrom'] = atac.var_names.map(lambda s: s.split(':')[0])
+        atac.var['chromStart'] = atac.var_names.map(lambda s: s.split(':')[1].split('-')[0]).astype(int)
+        atac.var['chromEnd'] = atac.var_names.map(lambda s: s.split(':')[1].split('-')[1]).astype(int)
+        atac.var['name'] = atac.var_names
+        atac = atac[:, atac.var['chrom'].notna()].copy()
+        # only accept chroms 1-22, X and Y
+        atac = atac[:, atac.var['chrom'].isin([f'chr{i}' for i in range(1, 23)] + ['chrX', 'chrY'])].copy()
+        atac_peaks = scglue.genomics.Bed(atac.var.assign(name=atac.var_names))
+        
+        sc.pp.filter_genes(atac, min_counts=2)
+        print(atac.var_names)
+        # use same number of features as in Hi-C data
+        sc.pp.highly_variable_genes(atac, n_top_genes=hic.shape[1], flavor="seurat_v3", span=1)
+        sc.pp.normalize_total(atac)
+        sc.pp.log1p(atac)
+        sc.pp.scale(atac)
+        sc.tl.pca(atac, n_comps=200, svd_solver="auto")
+        # compute lsi
+        # scglue.data.lsi(atac, n_components=100, n_iter=50, n_oversamples=20)
+        # sc.pp.neighbors(atac, use_rep="X_lsi", metric="cosine")
+        sc.pp.neighbors(atac, n_pcs=200, metric="cosine")
+        sc.tl.umap(atac)
+        fig = sc.pl.umap(atac, color=["celltype", "batch"], return_fig=True, wspace=0.6)
+        fig.tight_layout()
+        fig.savefig(f"{plot_dir}/atac_umap.png")
+        plt.close()
+
     if snapatac_init:
         # test SnapATAC2 embedding init
         import snapatac2 as snap
@@ -767,6 +802,33 @@ def preprocess_higlue(args, glue_args):
         sc.tl.umap(hic)
         fig = sc.pl.umap(hic, color=["celltype", "batch"], return_fig=True)
         fig.savefig(f'{plot_dir}/pfc_hic_umap_{resolution}_snap.png')
+        plt.close()
+    if init_embedding is not None:
+        import pickle
+        # load embedding result from SCORE and set as initial embedding
+        #init_embedding = ad.read_h5ad(init_embedding)
+        emb_pickle = os.path.join(init_embedding)
+        with open(emb_pickle, 'rb') as f:
+            emb = pickle.load(f)
+
+        adata = ad.AnnData(X=np.array(emb['z']))
+        adata.obs_names = emb['cell']
+        adata.obs_names = adata.obs_names.map(lambda s: s.replace(f'.{resolution}', ''))
+        adata.obs['celltype_int'] = emb['y']
+        adata.obs['celltype'] = emb['y']
+        print(init_embedding)
+        # make sure cell names are the same
+        try:
+            adata = adata[hic.obs_names].copy()
+        except:
+            pass
+        print(adata.obs_names[:10])
+        print(hic.obs_names[:10])
+        hic.obsm['X_lsi'] = adata.X
+        sc.pp.neighbors(hic, use_rep="X_lsi")
+        sc.tl.umap(hic)
+        fig = sc.pl.umap(hic, color=["celltype", "batch"], return_fig=True)
+        fig.savefig(f'{plot_dir}/pfc_hic_umap_{resolution}_init.png')
         plt.close()
     # add any pseudobulk loops that are in the scHi-C variable features but weren't loaded before
     # extra_loops = bulk.pixels(join=False)[:]
@@ -900,6 +962,8 @@ def preprocess_higlue(args, glue_args):
     #peaks = frags.set_index('peak_name')
     bait_oe['peak1'] = bait_oe['bin1_id'].map(peak_map)
     bait_oe['peak2'] = bait_oe['bin2_id'].map(peak_map)
+    print(bait_oe)
+    bait_oe = bait_oe.dropna().reset_index(drop=True)
     bait_oe['start1'] = bait_oe['bin1_id'].map(start_map).astype(int)
     bait_oe['start2'] = bait_oe['bin2_id'].map(start_map).astype(int)
     bait_oe['end1'] = bait_oe['bin1_id'].map(end_map).astype(int)
@@ -957,23 +1021,41 @@ def preprocess_higlue(args, glue_args):
     o_prior = o_prior.subgraph(hvg_reachable)
     if atac_file is not None:
         atac_o_prior = atac_overlap_graph.copy()
-        atac_reachable = scglue.graph.reachable_vertices(atac_o_prior, rna.var.query("highly_variable").index)
         atac_hic_o_prior = atac_hic_overlap_graph.copy()
-        #hic_gene_graph = scglue.graph.compose_multigraph(o_prior, pchic_graph)
-        #atac_hic_gene_graph = scglue.graph.compose_multigraph(atac_o_prior, hic_gene_graph)
-        #hvg_reachable = scglue.graph.reachable_vertices(atac_hic_gene_graph, rna.var.query("highly_variable").index)
+        # first limit to the highly variable ATAC peaks
+        atac_reachable = scglue.graph.reachable_vertices(atac_hic_o_prior, atac.var.query("highly_variable").index)
+        atac_hic_o_prior = atac_hic_o_prior.subgraph(atac_reachable)
+
         atac_o_prior = scglue.graph.compose_multigraph(atac_o_prior, atac_o_prior.reverse())
         atac_hic_o_prior = scglue.graph.compose_multigraph(atac_hic_o_prior, atac_hic_o_prior.reverse())
         atac_hic_o_prior = scglue.graph.compose_multigraph(atac_o_prior, atac_hic_o_prior)
-        #atac_hic_o_prior = scglue.graph.compose_multigraph(atac_o_prior, pchic_graph)
-        for item in itertools.chain(atac.var_names):
-            atac_o_prior.add_edge(item, item, weight=1.0, type="self-loop", sign=1)
-        #atac_reachable = scglue.graph.reachable_vertices(atac_hic_o_prior, rna.var.query("highly_variable").index)
+        #atac_hic_o_prior = scglue.graph.compose_multigraph(atac_hic_o_prior, pchic_graph)
+        # for item in itertools.chain(atac.var_names):
+        #     atac_o_prior.add_edge(item, item, weight=1.0, type="self-loop", sign=1)
+        #     atac_hic_o_prior.add_edge(item, item, weight=1.0, type="self-loop", sign=1)
+        #atac_reachable = scglue.graph.reachable_vertices(atac_o_prior, rna.var.query("highly_variable").index)
+        atac_reachable_hvgs = scglue.graph.reachable_vertices(atac_hic_o_prior, rna.var.query("highly_variable").index)
         
         #atac.var["highly_variable"] = [item in atac_reachable for item in atac.var_names]
-        atac_o_prior = atac_o_prior.subgraph(atac_reachable)
-        #atac_o_prior = atac_hic_o_prior.subgraph(atac_reachable)
-        print(atac_o_prior)
+        #atac_o_prior = atac_o_prior.subgraph(atac_reachable)
+        atac_o_prior = atac_hic_o_prior.subgraph(atac_reachable_hvgs)
+        # remove duplicate edges
+        atac_o_prior = scglue.graph.compose_multigraph(atac_o_prior, atac_o_prior.reverse())
+        for item in itertools.chain(atac.var_names):
+            atac_o_prior.add_edge(item, item, weight=1.0, type="self-loop", sign=1)
+        # remove nodes that are note connected to either a gene or a Hi-C node
+        remove_nodes = []
+        for node in tqdm(atac_o_prior.nodes):
+            if node in atac.var_names:
+                remove = True
+                for neighbor in atac_o_prior.neighbors(node):
+                    if neighbor in rna.var_names or neighbor in hic.var_names:
+                        remove = False
+                        break
+                if remove:
+                    remove_nodes.append(node)
+        atac_o_prior.remove_nodes_from(remove_nodes)
+        print('ATAC overlap graph:', atac_o_prior)
 
     d_prior = dist_graph.copy()
 
@@ -1015,6 +1097,7 @@ def preprocess_higlue(args, glue_args):
     hic.var["dcq_highly_variable"] = [item in hvg_reachable for item in hic.var_names]
     if atac_file is not None:
         atac_reachable = scglue.graph.reachable_vertices(dcq_prior, rna.var.query("highly_variable").index)
+        # atac.var["highly_variable"] = [item in atac_reachable for item in atac.var_names]
         atac.var["highly_variable"] = [item in atac_reachable for item in atac.var_names]
         print('ATAC variable Hi-C features', atac.var["highly_variable"].sum())
     keep_distal_mask = hic.var_names.map(lambda s: s[-2] == '-' or s[-3] == '-')
