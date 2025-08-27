@@ -3,8 +3,6 @@ import anndata as ad
 import networkx as nx
 import scanpy as sc
 import scglue
-import cooler
-import cooltools
 from cooler._logging import set_verbosity_level
 from matplotlib import rcParams
 import sys
@@ -18,6 +16,7 @@ from matplotlib.colors import LogNorm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 from tqdm import tqdm
+from scipy.stats import pearsonr
 from multiprocessing import Pool
 from sklearn.metrics import accuracy_score, adjusted_rand_score, silhouette_score
 from networkx.algorithms.bipartite import biadjacency_matrix
@@ -45,6 +44,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--exclusive_strata', action='store_true')
     glue_parser.add_argument('--use_xy', action='store_true')
     glue_parser.add_argument('--n_genes', type=int, default=10000)
+    glue_parser.add_argument('--n_atac_peaks', type=int, default=None)
     glue_parser.add_argument('--gene_list', nargs='+', default=None)
     glue_parser.add_argument('--no_depth_correction', action='store_true')
     glue_parser.add_argument('--use_trans', action='store_true')
@@ -61,6 +61,7 @@ if __name__ == '__main__':
     # SCORE args
     glue_parser.add_argument('--rna_file', type=str, default=None)
     glue_parser.add_argument('--atac_file', type=str, default=None)
+    glue_parser.add_argument('--methyl_file', type=str, default=None)
     glue_parser.add_argument('--gtf', type=str, default=None)
     glue_parser.add_argument('--dset', type=str, default=None)
     glue_parser.add_argument('--subname', type=str, default=None)
@@ -80,6 +81,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--lam_graph', type=str, default=0.1)
     glue_parser.add_argument('--lam_cycle', type=str, default=0.02)
     glue_parser.add_argument('--suffix', type=str, default='2d')
+    glue_parser.add_argument('--exp_name', type=str, default=None)
     glue_parser.add_argument('--save_interval', type=int, default=10)
     glue_parser.add_argument('--latent_dim', type=int, default=64)
     glue_parser.add_argument('--batch_size', type=int, default=128)
@@ -90,6 +92,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--lr', type=float, default=2e-3)
     glue_parser.add_argument('--max_epochs', type=int, default=None)
     glue_parser.add_argument('--wandb', action='store_true')
+    glue_parser.add_argument('--skip_balance', action='store_true')
     glue_parser.add_argument('--normalize_u', action='store_true')
     glue_parser.add_argument('--multi_strata_graph_encoder', action='store_true')
     glue_parser.add_argument('--shifted_additive', action='store_true')
@@ -129,6 +132,7 @@ if __name__ == '__main__':
     lam_graph = args.lam_graph
     lam_cycle = args.lam_cycle
     suffix = args.suffix
+    exp_name = args.exp_name
     save_interval = args.save_interval
     latent_dim = args.latent_dim
     batch_size = args.batch_size
@@ -151,24 +155,26 @@ if __name__ == '__main__':
     use_attn = args.use_attn
     binarize = args.binarize
     use_wandb = args.wandb
+    skip_balance = args.skip_balance
     use_rna_pca = not args.use_rna_counts
     use_atac_pca = not args.use_atac_counts
     use_batch = args.use_batch
     cache_checkpoint = args.cache_checkpoint
-    min_confidence = 0.4
     snapatac_init = args.snapatac_init
     init_embedding = args.init_embedding
     atac_file = args.atac_file
+    methyl_file = args.methyl_file
 
     if args.preprocess:
         preprocess_higlue(args, glue_args)
 
     if args.train:
-        
         prior = nx.read_graphml(f"{out_dir}/graphs/{graph_file_suffix}.graphml.gz") 
         rna = ad.read_h5ad(f"{out_dir}/rna/rna_{full_file_suffix}.h5ad")
         if atac_file is not None:
             atac = ad.read_h5ad(f"{out_dir}/atac/atac_{full_file_suffix}.h5ad")
+        if methyl_file is not None:
+            methyl = ad.read_h5ad(f"{out_dir}/methyl/methyl_{full_file_suffix}.h5ad")
         hic = ad.read_h5ad(f"{out_dir}/hic/hic_{full_file_suffix}.h5ad")
         try:
             hic.obs.loc[hic.obs_names.str.startswith('alpha_'), 'celltype'] = 'Alpha'
@@ -182,6 +188,7 @@ if __name__ == '__main__':
         rna.var["highly_variable"] = rna.var["highly_variable"] & rna.var["in_hic"]
         hic.var["highly_variable"] = True
         hic = hic[hic.obs['depth'] > min_depth, :]
+        hic.obs['read_depth'] = hic.obs['depth'].copy()  # for visualization later
 
         # set depth as fraction of total counts
         rna.obs['depth'] = rna.layers['counts'].sum(axis=1)
@@ -189,6 +196,9 @@ if __name__ == '__main__':
         if atac_file is not None:
             atac.obs['depth'] = atac.layers['counts'].sum(axis=1)
             atac.obs['depth'] = atac.obs['depth'] / atac.obs['depth'].max()
+        if methyl_file is not None:
+            methyl.obs['depth'] = methyl.layers['counts'].sum(axis=1)
+            methyl.obs['depth'] = methyl.obs['depth'] / methyl.obs['depth'].max()
         # set hic depth per batch
         for batch in hic.obs['batch'].unique():
             mask = hic.obs['batch'] == batch
@@ -300,6 +310,9 @@ if __name__ == '__main__':
         if atac_file is not None:
             atac_celltypes = atac.obs['celltype'].unique()
             atac.obs['celltype'] = pd.Categorical(atac.obs['celltype'], categories=atac_celltypes, ordered=True)
+        if methyl_file is not None:
+            methyl_celltypes = methyl.obs['celltype'].unique()
+            methyl.obs['celltype'] = pd.Categorical(methyl.obs['celltype'], categories=methyl_celltypes, ordered=True)
 
         if use_wandb:
             import wandb
@@ -307,6 +320,8 @@ if __name__ == '__main__':
                     sync_tensorboard=True, 
                     config={'prior': prior_name, 
                             'rna_file': args.rna_file,
+                            'atac_file': args.atac_file,
+                            'methyl_file': args.methyl_file,
                             'res': resolution,
                             'hic_type': hic_type,
                             'loop_q': loop_q,
@@ -347,9 +362,18 @@ if __name__ == '__main__':
         if atac_file is not None:
             scglue.models.configure_dataset(atac, "NB", use_highly_variable=True, use_layer="counts", 
                                         use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None)
-
+        if methyl_file is not None:
+            scglue.models.configure_dataset(methyl, "ZILN", use_highly_variable=True, use_layer="counts", 
+                                        use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None)
         print(f"Total nodes in prior: {len(prior.nodes)}")
-        if atac_file is not None:
+
+        if methyl_file is not None and atac_file is not None:
+            dataset_dict = {"rna": rna, "hic": hic, "atac": atac, "methyl": methyl}
+            modality_weights = {'rna': 1.0, 'hic': hic_weight, 'atac': 1.0, 'methyl': 1.0}
+        elif methyl_file is not None:
+            dataset_dict = {"rna": rna, "hic": hic, "methyl": methyl}
+            modality_weights = {'rna': 1.0, 'hic': hic_weight, 'methyl': 1.0}
+        elif atac_file is not None:
             dataset_dict = {"rna": rna, "hic": hic, "atac": atac}
             modality_weights = {'rna': 1.0, 'hic': hic_weight, 'atac': 1.0}
         else:
@@ -357,9 +381,9 @@ if __name__ == '__main__':
             modality_weights = {'rna': 1.0, 'hic': hic_weight}
         glue = scglue.models.fit_SCGLUE(
             dataset_dict, prior,
+            skip_balance=skip_balance,
             log_wandb=use_wandb,
             init_kws={"latent_dim": latent_dim, 
-                    #"use_distance_specific_graph": True, 
                     "shifted_additive": shifted_additive,
                     "use_activation": use_activation,
                     "use_attn": use_attn,
@@ -374,7 +398,7 @@ if __name__ == '__main__':
                         "lr": lr,
                         "modality_weight": modality_weights},
             balance_kws={"resolution": 1.0},
-            fit_kws={"directory": "glue", 
+            fit_kws={"directory": "glue" if exp_name is None else exp_name,
                     "neg_samples": neg_samples,
                     "val_split": 0.05,
                     "data_batch_size": batch_size,
@@ -395,18 +419,30 @@ if __name__ == '__main__':
             atac.obsm["X_glue"] = glue.encode_data("atac", atac)
             atac.obs['domain'] = 'atac'
             atac.obs['old_celltype'] = atac.obs['celltype']
+        if methyl_file is not None:
+            methyl.obsm["X_glue"] = glue.encode_data("methyl", methyl)
+            methyl.obs['domain'] = 'methyl'
+            methyl.obs['old_celltype'] = methyl.obs['celltype']
 
         rna.obs['domain'] = 'rna'
         hic.obs['domain'] = 'hic'
 
         rna.obs['old_celltype'] = rna.obs['celltype']
         hic.obs['old_celltype'] = hic.obs['celltype']
+        
         # run leiden clustering to identify clusters
         sc.pp.neighbors(hic, use_rep="X_glue", metric="cosine")
         sc.tl.leiden(hic)
 
         sc.pp.neighbors(rna, use_rep="X_glue", metric="cosine")
         sc.tl.leiden(rna)
+
+        if atac_file is not None:
+            sc.pp.neighbors(atac, use_rep="X_glue", metric="cosine")
+            sc.tl.leiden(atac)
+        if methyl_file is not None:
+            sc.pp.neighbors(methyl, use_rep="X_glue", metric="cosine")
+            sc.tl.leiden(methyl)
 
         # transfer labels to predict celltypes
         scglue.data.transfer_labels(rna, hic, "celltype", use_rep="X_glue", n_neighbors=n_neighbors)
@@ -438,8 +474,6 @@ if __name__ == '__main__':
             rna_celltype_map = {c: i for i, c in enumerate(rna_celltypes)}
             print(rna_celltype_map)
             rna.obs['old_celltype_int'] = rna.obs['old_celltype'].map(rna_celltype_map)
-            #rna.obs['celltype_int'] = rna.obs['leiden'].map(rna_celltype_map)
-            #rna.obs['celltype_int'].fillna(len(rna_celltypes), inplace=True)
             rna_accuracy = accuracy_score(rna.obs['old_celltype_int'], rna.obs['leiden'])
             rna_ari = adjusted_rand_score(rna.obs['old_celltype_int'], rna.obs['leiden'])
             rna_sil_score = silhouette_score(rna.obsm['X_glue'], rna.obs['leiden'])
@@ -460,38 +494,53 @@ if __name__ == '__main__':
                     atac.obs['celltype_int'].fillna(len(atac_celltypes), inplace=True)
                     atac_accuracy = accuracy_score(atac.obs['old_celltype_int'], atac.obs['celltype_int'])
                     atac_ari = adjusted_rand_score(atac.obs['old_celltype_int'], atac.obs['celltype_int'])
+                    atac_ari_leiden = adjusted_rand_score(atac.obs['old_celltype_int'], atac.obs['leiden'])
                     atac_sil_score = silhouette_score(atac.obsm['X_glue'], atac.obs['celltype_int'])
                     if use_wandb:
                         wandb.log({"atac_accuracy": atac_accuracy, 
                                 "atac_ari": atac_ari,
+                                "atac_ari_leiden": atac_ari_leiden,
                                 "atac_silhouette_score": atac_sil_score})
                 except Exception as e:
                     print(e)
+            # if methyl file is provided, do the same for methyl
+            if methyl_file is not None:
+                try:
+                    scglue.data.transfer_labels(rna, methyl, "celltype", use_rep="X_glue", n_neighbors=n_neighbors)
+                    methyl_celltypes = methyl.obs['old_celltype'].unique()
+                    methyl_celltype_map = {c: i for i, c in enumerate(methyl_celltypes)}
+                    methyl.obs['old_celltype_int'] = methyl.obs['old_celltype'].map(methyl_celltype_map)
+                    methyl.obs['celltype_int'] = methyl.obs['celltype'].map(methyl_celltype_map)
+                    # replace NaNs with the last index
+                    methyl.obs['celltype_int'].fillna(len(methyl_celltypes), inplace=True)
+                    methyl_accuracy = accuracy_score(methyl.obs['old_celltype_int'], methyl.obs['celltype_int'])
+                    methyl_ari = adjusted_rand_score(methyl.obs['old_celltype_int'], methyl.obs['celltype_int'])
+                    methyl_ari_leiden = adjusted_rand_score(methyl.obs['old_celltype_int'], methyl.obs['leiden'])
+                    methyl_sil_score = silhouette_score(methyl.obsm['X_glue'], methyl.obs['celltype_int'])
+                    if use_wandb:
+                        wandb.log({"methyl_accuracy": methyl_accuracy, 
+                                "methyl_ari": methyl_ari,
+                                "methyl_ari_leiden": methyl_ari_leiden,
+                                "methyl_silhouette_score": methyl_sil_score})
+                except Exception as e:
+                    print(e)
 
-            # remove low confidence cells
-            #hic = hic[hic.obs['celltype_confidence'] > min_confidence, :].copy()
-            #hic = hic[hic.obs['depth'] > min_depth, :]
-
-            # compute filtered accuracy
-            accuracy = accuracy_score(hic.obs['old_celltype_int'], hic.obs['celltype_int'])
-            ari = adjusted_rand_score(hic.obs['old_celltype_int'], hic.obs['celltype_int'])
-            ari_leiden = adjusted_rand_score(hic.obs['old_celltype_int'], hic.obs['leiden'])
-            if use_wandb:
-                wandb.log({"accuracy_filtered": accuracy, 
-                        "ari_filtered": ari_leiden,
-                        "ari_filtered_label_transfer": ari})
         except Exception as e:
             print(e)
             pass
         
-        if atac_file is not None:
+        if methyl_file is not None and atac_file is not None:
+            combined = ad.concat([rna, hic, atac, methyl])
+        elif methyl_file is not None:
+            combined = ad.concat([rna, hic, methyl])
+        elif atac_file is not None:
             combined = ad.concat([rna, hic, atac])
         else:
             combined = ad.concat([rna, hic])
 
         sc.pp.neighbors(hic, use_rep="X_glue", metric="cosine", n_neighbors=n_neighbors)
         sc.tl.umap(hic)
-        fig = sc.pl.umap(hic, color=["old_celltype", "celltype", "celltype_confidence", "depth", "batch"], palette=color_map,wspace=0.45, return_fig=True)
+        fig = sc.pl.umap(hic, color=["old_celltype", "celltype", "celltype_confidence", "read_depth", "batch"], palette=color_map,wspace=0.45, return_fig=True)
         fig.savefig('glue_umap.png')
         plt.close()
         if use_wandb:
@@ -506,6 +555,30 @@ if __name__ == '__main__':
         if use_wandb:
             wandb.log({"joint_umap": wandb.Image('glue_joint_umap.png')})
 
+        # if any cells are paired, check their embedding distance
+        avg_paired_dist = 0
+        paired_mask = hic.obs_names.isin(rna.obs_names)
+        avg_corr = 0
+        avg_paired_expr_corr = 0
+        avg_paired_dist = 0
+        if np.sum(paired_mask) > 0:
+            paired_hic = hic[paired_mask, :].copy()
+            paired_rna = rna[rna.obs_names.isin(paired_hic.obs_names)].copy()
+            hic_z = paired_hic.obsm['X_glue']
+            rna_z = paired_rna.obsm['X_glue']
+            print(hic_z.shape, rna_z.shape)
+            dists = np.linalg.norm(hic_z - rna_z, axis=1)
+            corrs = []
+            for i in range(hic_z.shape[0]):
+                corr, _ = pearsonr(hic_z[i], rna_z[i])
+                corrs.append(corr)
+            avg_paired_dist = np.mean(dists)
+            avg_corr = np.mean(corrs)
+            print(f"Avg. embedding distance between paired cells: {avg_paired_dist}")
+            print(f"Avg. embedding correlation between paired cells: {avg_corr}")
+            if use_wandb:
+                wandb.log({"paired_distance": avg_paired_dist, "paired_correlation": avg_corr})
+                
         if cache_checkpoint:
             # save the cell type predictions and cell coordinates
             pred_checkpoint = f"{cache_checkpoint}_predictions"
@@ -564,6 +637,17 @@ if __name__ == '__main__':
                 if celltype not in celltypes:
                     atac_color_map[str(celltype) + '_atac'] = colors[-1]
             rna_color_map = {**rna_color_map, **atac_color_map}
+        if methyl_file is not None:
+            methyl_mask = combined.obs['domain'] == 'methyl'
+            methyl_celltypes = methyl.obs['celltype'].unique()
+            print(methyl_celltypes)
+            combined.obs.loc[methyl_mask, 'old_celltype'] += '_methyl'
+            combined.obs.loc[methyl_mask, 'celltype'] += '_methyl'
+            methyl_color_map = {celltype + '_methyl': colors[i] for i, celltype in enumerate(celltypes)}
+            for celltype in methyl_celltypes:
+                if celltype not in celltypes:
+                    methyl_color_map[str(celltype) + '_methyl'] = colors[-1]
+            rna_color_map = {**rna_color_map, **methyl_color_map}
         color_map = {**color_map, **rna_color_map}
         color_map['Other'] = 'gray'
         
@@ -579,7 +663,7 @@ if __name__ == '__main__':
 
         if atac_file is not None:
             try:
-                fig = sc.pl.umap(combined[combined.obs["domain"] == "atac"], color=["old_celltype"], wspace=0.45, return_fig=True)
+                fig = sc.pl.umap(combined[combined.obs["domain"] == "atac"], color=["old_celltype", "celltype"], wspace=0.45, return_fig=True)
                 fig.savefig('glue_joint_umap_atac.png')
                 plt.close()
                 if use_wandb:
@@ -598,6 +682,30 @@ if __name__ == '__main__':
                 plt.close()
                 if use_wandb:
                     wandb.log({"joint_umap_separate_atac": wandb.Image('glue_joint_umap_separate_atac.png')})
+            except Exception as e:
+                print(e)
+        
+        if methyl_file is not None:
+            try:
+                fig = sc.pl.umap(combined[combined.obs["domain"] == "methyl"], color=["old_celltype", "celltype"], wspace=0.45, return_fig=True)
+                fig.savefig('glue_joint_umap_methyl.png')
+                plt.close()
+                if use_wandb:
+                    wandb.log({"joint_umap_methyl": wandb.Image('glue_joint_umap_methyl.png')})
+            except Exception as e:
+                print(e)
+                pass
+            try:
+                methyl_celltypes = [c + '_methyl' for c in methyl_celltypes]
+                if 'islet' in dataset_name or 'pfc' in dataset_name:  # paired celltype names
+                    methyl_color_map = color_map
+                else:
+                    methyl_color_map = sc.pl.palettes.godsnot_102
+                fig = sc.pl.umap(combined, color=["old_celltype", "celltype"], groups=methyl_celltypes, palette=methyl_color_map, size=100, wspace=0.65, return_fig=True)
+                fig.savefig('glue_joint_umap_separate_methyl.png')
+                plt.close()
+                if use_wandb:
+                    wandb.log({"joint_umap_separate_methyl": wandb.Image('glue_joint_umap_separate_methyl.png')})
             except Exception as e:
                 print(e)
         
@@ -623,71 +731,6 @@ if __name__ == '__main__':
             val_celltype_asw = silhouette_score(sorted_hic.obsm['X_glue'], sorted_hic.obs['celltype_int'])
             if use_wandb:
                 wandb.log({"val_celltype_asw": val_celltype_asw})
-
-            confident_filtered_hic = sorted_hic[sorted_hic.obs['celltype_confidence'] > min_confidence, :].copy()
-            confident_filtered_hic = confident_filtered_hic[confident_filtered_hic.obs['depth'] > min_depth, :]
-            # measure accuracy
-            val_accuracy = accuracy_score(confident_filtered_hic.obs['celltype_int'], confident_filtered_hic.obs['pred_celltype_int'])
-            val_ari = adjusted_rand_score(confident_filtered_hic.obs['celltype_int'], confident_filtered_hic.obs['pred_celltype_int'])
-            if use_wandb:
-                wandb.log({"val_accuracy_filtered": val_accuracy, "val_ari_filtered": val_ari})
-
-        #try to save tmp vizualizations as animated gifs
-        try:
-            # import imageio
-            # frame_duration = 0.2
-            # pca_dir = 'tmp_imgs/pca'
-            # with imageio.get_writer('pca.gif', mode='I', duration=frame_duration, loop=0) as writer:
-            #     pretrain_files = [f for f in sorted_nicely(os.listdir(pca_dir)) if 'pretrain' in f]
-            #     finetune_files = [f for f in sorted_nicely(os.listdir(pca_dir)) if 'finetune' in f]
-            #     for filename in pretrain_files + finetune_files + [finetune_files[-1]] * 20:
-            #         filepath = os.path.join(pca_dir, filename)
-            #         image = imageio.imread(filepath)
-            #         writer.append_data(image)
-            #     for filename in pretrain_files + finetune_files:
-            #         filepath = os.path.join(pca_dir, filename)
-            #         try:
-            #             os.remove(filepath)
-            #         except Exception:
-            #             pass
-            # if use_wandb:
-            #     wandb.log({"pca_gif": wandb.Image('pca.gif')})
-            # umap_dir = 'tmp_imgs/umap'
-            # with imageio.get_writer('umap.gif', mode='I', duration=frame_duration, loop=0) as writer:
-            #     pretrain_files = [f for f in sorted_nicely(os.listdir(umap_dir)) if 'pretrain' in f]
-            #     finetune_files = [f for f in sorted_nicely(os.listdir(umap_dir)) if 'finetune' in f]
-            #     for filename in pretrain_files + finetune_files + [finetune_files[-1]] * 20:
-            #         filepath = os.path.join(umap_dir, filename)
-            #         image = imageio.imread(filepath)
-            #         writer.append_data(image)
-            #     for filename in pretrain_files + finetune_files:
-            #         filepath = os.path.join(umap_dir, filename)
-            #         try:
-            #             os.remove(filepath)
-            #         except Exception:
-            #             pass
-            # if use_wandb:
-            #     wandb.log({"umap_gif": wandb.Image('umap.gif')})
-            import imageio
-            frame_duration = 0.2
-            pca_dir = 'tmp_imgs/features'
-            with imageio.get_writer('features.gif', mode='I', duration=frame_duration, loop=0) as writer:
-                pretrain_files = [f for f in sorted_nicely(os.listdir(pca_dir)) if 'pretrain' in f]
-                finetune_files = [f for f in sorted_nicely(os.listdir(pca_dir)) if 'finetune' in f]
-                for filename in pretrain_files + finetune_files + [finetune_files[-1]] * 20:
-                    filepath = os.path.join(pca_dir, filename)
-                    image = imageio.imread(filepath)
-                    writer.append_data(image)
-                for filename in pretrain_files + finetune_files:
-                    filepath = os.path.join(pca_dir, filename)
-                    try:
-                        os.remove(filepath)
-                    except Exception:
-                        pass
-            if use_wandb:
-                wandb.log({"features_gif": wandb.Image('features.gif')})
-        except Exception as e:
-            print(e)
 
         if use_wandb:
             wandb.finish()
