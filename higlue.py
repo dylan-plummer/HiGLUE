@@ -28,15 +28,15 @@ if __name__ == '__main__':
     glue_parser = argparse.ArgumentParser()
     # preprocessing args
     glue_parser.add_argument('--data_dir', type=str, default='')
-    glue_parser.add_argument('--loop_q', type=str, default='0.99')
-    glue_parser.add_argument('--n_strata', type=int, default=5)
+    glue_parser.add_argument('--loop_q', type=str, default='0.98')
+    glue_parser.add_argument('--n_strata', type=int, default=10)
     glue_parser.add_argument('--use_ice', action='store_true')
     glue_parser.add_argument('--use_dist_norm', action='store_true')
-    glue_parser.add_argument('--use_2d', action='store_true')
     glue_parser.add_argument('--viz_rna', action='store_true')
     glue_parser.add_argument('--load_rna', action='store_true')
     glue_parser.add_argument('--preprocess', action='store_true')
     glue_parser.add_argument('--train', action='store_true')
+    glue_parser.add_argument('--seed', type=int, default=36)
     glue_parser.add_argument('--offset', type=int, default=0)
     glue_parser.add_argument('--min_count', type=int, default=0)
     glue_parser.add_argument('--distal_interactions', type=int, default=None)
@@ -48,15 +48,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--gene_list', nargs='+', default=None)
     glue_parser.add_argument('--no_depth_correction', action='store_true')
     glue_parser.add_argument('--use_trans', action='store_true')
-    glue_parser.add_argument('--bulk_rna_sampling', action='store_true')
-    glue_parser.add_argument('--bulk_n_samples', type=int, default=2000)
-    glue_parser.add_argument('--bulk_n_counts', type=int, default=1000)
     glue_parser.add_argument('--bulk_hic', type=str, default=None)
-    glue_parser.add_argument('--coexpression_network', type=str, default=None)
-    glue_parser.add_argument('--coexpression_edges', type=int, default=10000)
-    glue_parser.add_argument('--cis_coexpression', action='store_true')
-    glue_parser.add_argument('--snapatac_init', action='store_true')
-    glue_parser.add_argument('--init_embedding', type=str, default=None)
 
     # SCORE args
     glue_parser.add_argument('--rna_file', type=str, default=None)
@@ -92,15 +84,11 @@ if __name__ == '__main__':
     glue_parser.add_argument('--lr', type=float, default=2e-3)
     glue_parser.add_argument('--max_epochs', type=int, default=None)
     glue_parser.add_argument('--wandb', action='store_true')
-    glue_parser.add_argument('--skip_balance', action='store_true')
+    glue_parser.add_argument('--balance', action='store_true')
     glue_parser.add_argument('--normalize_u', action='store_true')
-    glue_parser.add_argument('--multi_strata_graph_encoder', action='store_true')
-    glue_parser.add_argument('--shifted_additive', action='store_true')
-    glue_parser.add_argument('--use_activation', action='store_true')
-    glue_parser.add_argument('--use_attn', action='store_true')
     glue_parser.add_argument('--binarize', action='store_true')
     glue_parser.add_argument('--use_batch', type=str, default=None)
-    glue_parser.add_argument('--use_rna_counts', action='store_true')
+    glue_parser.add_argument('--use_rna_pca', action='store_true')
     glue_parser.add_argument('--use_atac_counts', action='store_true')
     glue_parser.add_argument('--cache_checkpoint', type=str, default=None)
 
@@ -108,7 +96,7 @@ if __name__ == '__main__':
     args = glue_parser.parse_args(sys.argv[1:glue_args] + sys.argv[glue_args + 1:])
 
     dataset_name = args.dset
-    out_dir = f'{dataset_name}_data'
+    out_dir = f'data/{dataset_name}_data'
     if args.data_dir != '':
         out_dir = f'{args.data_dir}'
     os.makedirs(out_dir, exist_ok=True)
@@ -118,6 +106,7 @@ if __name__ == '__main__':
     filter_strata = args.filter_strata
     exclusive_strata = args.exclusive_strata
     use_xy = args.use_xy
+    seed = args.seed
     min_count = args.min_count
     n_genes = args.n_genes
     hic_type = 'raw'
@@ -144,24 +133,17 @@ if __name__ == '__main__':
     lr = args.lr
     max_epochs = args.max_epochs if args.max_epochs is not None else "AUTO"
     normalize_u = args.normalize_u
-    multi_strata_graph_encoder = args.multi_strata_graph_encoder
     full_file_suffix = f"{resolution}_{hic_type}_{loop_q}_{suffix}_{n_strata}"
     graph_file_suffix = f"{prior_name}_prior_{resolution}_{hic_type}_{loop_q}_{suffix}_{n_strata}"
     use_rep = None
     min_depth = args.min_depth
-    counts_per_cell = args.bulk_n_counts
-    shifted_additive = args.shifted_additive
-    use_activation = args.use_activation
-    use_attn = args.use_attn
+    use_attn = True
     binarize = args.binarize
     use_wandb = args.wandb
-    skip_balance = args.skip_balance
-    use_rna_pca = not args.use_rna_counts
-    use_atac_pca = not args.use_atac_counts
+    skip_balance = not args.balance
+    use_rna_pca = args.use_rna_pca
     use_batch = args.use_batch
     cache_checkpoint = args.cache_checkpoint
-    snapatac_init = args.snapatac_init
-    init_embedding = args.init_embedding
     atac_file = args.atac_file
     methyl_file = args.methyl_file
 
@@ -328,7 +310,6 @@ if __name__ == '__main__':
                             'suffix': suffix, 
                             'min_depth': min_depth,
                             'n_distal_interactions': n_distal_interactions,
-                            'counts_per_cell_rna': counts_per_cell,
                             'filter_strata': filter_strata,
                             'min_count': min_count,
                             'n_genes': n_genes,
@@ -341,14 +322,9 @@ if __name__ == '__main__':
                             'neg_samples': neg_samples,
                             'use_trans': use_trans,
                             'normalize_u': normalize_u,
-                            'shifted_additive': shifted_additive,
-                            'use_activation': use_activation,
                             'use_attn': use_attn,
                             'distances_normalized': args.use_dist_norm,
                             'binarize': binarize,
-                            'multi_strata_graph_encoder': multi_strata_graph_encoder,
-                            'coexpression_network': args.coexpression_network,
-                            'coexpression_edges': args.coexpression_edges,
                             'lr': lr,
                             'hic_weight': hic_weight,
                             'n_neighbors': n_neighbors,
@@ -357,7 +333,7 @@ if __name__ == '__main__':
 
         scglue.models.configure_dataset(rna, "NB", use_highly_variable=True, use_layer="counts", use_rep="X_pca" if use_rna_pca else None,
                                         use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None)
-        scglue.models.configure_dataset(hic, "HiCZINB", use_highly_variable=True, use_layer="counts", use_rep="X_lsi" if (snapatac_init or init_embedding is not None) else None,
+        scglue.models.configure_dataset(hic, "HiCZINB", use_highly_variable=True, use_layer="counts", use_rep=None,
                                         use_depth="depth" if depth_correction else None, use_batch="batch")
         if atac_file is not None:
             scglue.models.configure_dataset(atac, "NB", use_highly_variable=True, use_layer="counts", 
@@ -384,13 +360,12 @@ if __name__ == '__main__':
             skip_balance=skip_balance,
             log_wandb=use_wandb,
             init_kws={"latent_dim": latent_dim, 
-                    "shifted_additive": shifted_additive,
-                    "use_activation": use_activation,
                     "use_attn": use_attn,
                     "binarize": binarize,
                     "h_dim": h_dim,
                     "h_depth": h_depth,
-                    "n_strata": n_strata},
+                    "n_strata": n_strata,
+                    "random_seed": seed},
             compile_kws={"lam_align": lam_align, 
                         "lam_graph": lam_graph,
                         "lam_cycle": lam_cycle,
@@ -578,14 +553,14 @@ if __name__ == '__main__':
             print(f"Avg. embedding correlation between paired cells: {avg_corr}")
             if use_wandb:
                 wandb.log({"paired_distance": avg_paired_dist, "paired_correlation": avg_corr})
-                
+
         if cache_checkpoint:
             # save the cell type predictions and cell coordinates
             pred_checkpoint = f"{cache_checkpoint}_predictions"
             os.makedirs(pred_checkpoint, exist_ok=True)
             n_checkpoints = len(os.listdir(pred_checkpoint))
             combined_hic_only = combined[combined.obs['domain'] == 'hic']
-            neighbors_list = [5, 10, 15, 20, 50, 100]
+            neighbors_list = [5, 10, 15, 20, 50]
             df = {'cell': list(hic.obs_names), 'old_celltype': list(hic.obs['old_celltype']), 
                   'combined_umap_1': list(combined_hic_only.obsm['X_umap'][:, 0]),
                   'combined_umap_2': list(combined_hic_only.obsm['X_umap'][:, 1])}
@@ -687,7 +662,7 @@ if __name__ == '__main__':
         
         if methyl_file is not None:
             try:
-                fig = sc.pl.umap(combined[combined.obs["domain"] == "methyl"], color=["old_celltype", "celltype"], wspace=0.45, return_fig=True)
+                fig = sc.pl.umap(combined[combined.obs["domain"] == "methyl"], color=["old_celltype", "celltype"], wspace=0.65, return_fig=True)
                 fig.savefig('glue_joint_umap_methyl.png')
                 plt.close()
                 if use_wandb:
