@@ -49,6 +49,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--no_depth_correction', action='store_true')
     glue_parser.add_argument('--use_trans', action='store_true')
     glue_parser.add_argument('--bulk_hic', type=str, default=None)
+    glue_parser.add_argument('--coassay', type=str, nargs='+', default=None)
 
     # SCORE args
     glue_parser.add_argument('--rna_file', type=str, default=None)
@@ -74,7 +75,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--lam_cycle', type=str, default=0.02)
     glue_parser.add_argument('--suffix', type=str, default='2d')
     glue_parser.add_argument('--exp_name', type=str, default=None)
-    glue_parser.add_argument('--save_interval', type=int, default=10)
+    glue_parser.add_argument('--save_interval', type=int, default=100)
     glue_parser.add_argument('--latent_dim', type=int, default=64)
     glue_parser.add_argument('--batch_size', type=int, default=128)
     glue_parser.add_argument('--h_dim', type=int, default=128)
@@ -121,6 +122,7 @@ if __name__ == '__main__':
     lam_graph = args.lam_graph
     lam_cycle = args.lam_cycle
     suffix = args.suffix
+    coassay = args.coassay
     exp_name = args.exp_name
     save_interval = args.save_interval
     latent_dim = args.latent_dim
@@ -332,15 +334,19 @@ if __name__ == '__main__':
                             'lam_graph': lam_graph})
 
         scglue.models.configure_dataset(rna, "NB", use_highly_variable=True, use_layer="counts", use_rep="X_pca" if use_rna_pca else None,
-                                        use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None)
+                                        use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None,
+                                        use_obs_names=True if 'rna' in coassay else False)
         scglue.models.configure_dataset(hic, "HiCZINB", use_highly_variable=True, use_layer="counts", use_rep=None,
-                                        use_depth="depth" if depth_correction else None, use_batch="batch")
+                                        use_depth="depth" if depth_correction else None, use_batch="batch",
+                                        use_obs_names=True if 'hic' in coassay else False)
         if atac_file is not None:
             scglue.models.configure_dataset(atac, "NB", use_highly_variable=True, use_layer="counts", 
-                                        use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None)
+                                        use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None,
+                                        use_obs_names=True if 'atac' in coassay else False)
         if methyl_file is not None:
             scglue.models.configure_dataset(methyl, "ZILN", use_highly_variable=True, use_layer="counts", 
-                                        use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None)
+                                        use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None,
+                                        use_obs_names=True if 'methyl' in coassay else False)
         print(f"Total nodes in prior: {len(prior.nodes)}")
 
         if methyl_file is not None and atac_file is not None:
@@ -379,7 +385,8 @@ if __name__ == '__main__':
                     "data_batch_size": batch_size,
                     "max_epochs": max_epochs,
                     "save_interval": save_interval,
-                    "wait_n_lrs": wait_n_lrs}
+                    "wait_n_lrs": wait_n_lrs},
+            model=scglue.models.PairedSCGLUEModel if coassay is not None else scglue.models.SCGLUEModel
         )
 
         glue.save(f"{out_dir}/glue_hic_{prior_name}_prior_{resolution}_{n_genes}_{n_strata}.dill")

@@ -338,6 +338,11 @@ def preprocess_higlue(args, glue_args):
         
         if 'batch' not in rna.obs.columns:
             rna.obs['batch'] = 0
+        if 'celltype' not in rna.obs.columns:
+            if 'cell_type' in rna.obs.columns:
+                rna.obs['celltype'] = rna.obs['cell_type']
+            else:
+                rna.obs['celltype'] = 'Unknown'
         rna.layers["counts"] = rna.X.copy()
         keep_columns = scglue.genomics.Bed.COLUMNS
         for col in keep_columns:
@@ -439,7 +444,6 @@ def preprocess_higlue(args, glue_args):
             if k - loops_offset == 0:
                 strata_hic.var_names = genomic_pos
             else:
-                print(strata_hic.var_names.shape, genomic_pos.shape)
                 if strata_hic.var_names.shape != genomic_pos.shape:
                     strata_hic.var_names = genomic_pos.iloc[:-(k - loops_offset)] + f'-{k - loops_offset}'
                 else:
@@ -515,11 +519,8 @@ def preprocess_higlue(args, glue_args):
     gene_mask = gene_mask | keep_non_distal_mask
     hic = hic[:, gene_mask].copy()
     print(hic)
-    #sc.pp.normalize_per_cell(hic, counts_per_cell_after=1e5)
     sc.tl.pca(hic, n_comps=min(100, hic.shape[0]), svd_solver="auto")
     sc.pp.neighbors(hic, n_pcs=min(100, hic.shape[0]), metric="cosine")
-    # scglue.data.lsi(hic, n_components=100, n_iter=50, n_oversamples=20)
-    # sc.pp.neighbors(hic, use_rep="X_lsi", metric="cosine")
     sc.tl.umap(hic)
     fig = sc.pl.umap(hic, color=["celltype", "batch"], return_fig=True)
     fig.savefig(f'{plot_dir}/hic_umap_{resolution}.png')
@@ -529,6 +530,11 @@ def preprocess_higlue(args, glue_args):
         atac = ad.read_h5ad(atac_file)
         if 'batch' not in atac.obs.columns:
             atac.obs['batch'] = 0
+        if 'celltype' not in atac.obs.columns:
+            if 'cell_type' in atac.obs.columns:
+                atac.obs['celltype'] = atac.obs['cell_type']
+            else:
+                atac.obs['celltype'] = 'Unknown'
         atac.layers["counts"] = atac.X.copy()
         atac.var['chrom'] = atac.var_names.map(lambda s: s.split(':')[0])
         atac.var['chromStart'] = atac.var_names.map(lambda s: s.split(':')[1].split('-')[0]).astype(int)
