@@ -123,6 +123,8 @@ if __name__ == '__main__':
     lam_cycle = args.lam_cycle
     suffix = args.suffix
     coassay = args.coassay
+    if coassay is None:
+        coassay = []
     exp_name = args.exp_name
     save_interval = args.save_interval
     latent_dim = args.latent_dim
@@ -349,6 +351,13 @@ if __name__ == '__main__':
                                         use_obs_names=True if 'methyl' in coassay else False)
         print(f"Total nodes in prior: {len(prior.nodes)}")
 
+        rna.obs_names_make_unique()
+        hic.obs_names_make_unique()
+        if atac_file is not None:
+            atac.obs_names_make_unique()
+        if methyl_file is not None:
+            methyl.obs_names_make_unique()
+
         if methyl_file is not None and atac_file is not None:
             dataset_dict = {"rna": rna, "hic": hic, "atac": atac, "methyl": methyl}
             modality_weights = {'rna': 1.0, 'hic': hic_weight, 'atac': 1.0, 'methyl': 1.0}
@@ -386,7 +395,7 @@ if __name__ == '__main__':
                     "max_epochs": max_epochs,
                     "save_interval": save_interval,
                     "wait_n_lrs": wait_n_lrs},
-            model=scglue.models.PairedSCGLUEModel if coassay is not None else scglue.models.SCGLUEModel
+            model=scglue.models.PairedSCGLUEModel if len(coassay) > 0 else scglue.models.SCGLUEModel
         )
 
         glue.save(f"{out_dir}/glue_hic_{prior_name}_prior_{resolution}_{n_genes}_{n_strata}.dill")

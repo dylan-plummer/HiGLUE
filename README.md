@@ -1,26 +1,20 @@
 # HiGLUE
 Joint generative modeling of single-cell Hi-C with other single-cell modalities via Graph-Linked Unified Embedding (GLUE)
 
-HiGLUE depends on the following packages: 
+HiGLUE is an extension of [GLUE](https://scglue.readthedocs.io/en/latest/) for scHi-C and depends on the following packages: 
 
-* `SCORE`: https://github.com/JinLabBioinfo/SCORE.git
+`pip install git+https://github.com/JinLabBioinfo/SCORE.git` (for scHi-C data processing)
 
-* `scglue`: https://scglue.readthedocs.io/en/latest/ (note that HiGLUE currently needs a custom fork of `scglue`)
-
-To install these packages for HiGLUE, you can run the following:
-
-`pip install git+https://github.com/JinLabBioinfo/SCORE.git`
-
-`pip install git+https://github.com/dylan-plummer/GLUE.git`
+`pip install git+https://github.com/dylan-plummer/GLUE.git` (custom fork of `scglue`)
 
 
 After installing the above packages, you need the following input files:
 
-* RNA data in `h5ad` format compatible with `scanpy`
+* RNA data in `.h5ad` format compatible with `scanpy`
 
 * scHi-C data in `.scool` format and metadata compatible with `SCORE`
 
-* A `gtf` file for the genome assembly used in the RNA and scHi-C data
+* A `.gtf` file for the genome assembly used in the RNA and scHi-C data
 
 Then you can run HiGLUE with the following command:
 
