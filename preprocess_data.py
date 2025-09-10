@@ -519,6 +519,9 @@ def preprocess_higlue(args, glue_args):
     gene_mask = gene_mask | keep_non_distal_mask
     hic = hic[:, gene_mask].copy()
     print(hic)
+    sc.pp.normalize_total(hic)
+    sc.pp.log1p(hic)
+    sc.pp.scale(hic)
     sc.tl.pca(hic, n_comps=min(100, hic.shape[0]), svd_solver="auto")
     sc.pp.neighbors(hic, n_pcs=min(100, hic.shape[0]), metric="cosine")
     sc.tl.umap(hic)
@@ -605,48 +608,6 @@ def preprocess_higlue(args, glue_args):
         fig.tight_layout()
         fig.savefig(f"{plot_dir}/methyl_umap.png")
         plt.close()
-
-    # add any pseudobulk loops that are in the scHi-C variable features but weren't loaded before
-    # extra_loops = bulk.pixels(join=False)[:]
-    # extra_loops['chr1'] = extra_loops['bin1_id'].map(chr_map)
-    # extra_loops['chr2'] = extra_loops['bin2_id'].map(chr_map)
-    # extra_loops['start1'] = extra_loops['bin1_id'].map(start_map).astype(int)
-    # extra_loops['start2'] = extra_loops['bin2_id'].map(start_map).astype(int)
-    # extra_loops['end1'] = extra_loops['bin1_id'].map(end_map).astype(int)
-    # extra_loops['end2'] = extra_loops['bin2_id'].map(end_map).astype(int)
-    # if use_ice:
-    #     weight_map = frags['weight'].to_dict()
-    #     extra_loops['weight1'] = extra_loops['bin1_id'].map(weight_map)
-    #     extra_loops['weight2'] = extra_loops['bin2_id'].map(weight_map)
-    #     extra_loops['oe'] = extra_loops['count'] * extra_loops['weight1'] * extra_loops['weight2']
-    #     extra_loops['rank'] = extra_loops['oe'].rank(pct=True)
-    # else:
-    #     extra_loops['rank'] = extra_loops['count'].rank(pct=True)
-    # extra_loops.dropna(inplace=True)
-    # print(extra_loops)
-    # loop_dfs = []
-    # print('Filtering top loops in each chromosome...')
-    # for chr_name in tqdm(sorted_nicely(bulk.chromnames)):
-    #     chr_loops = extra_loops[(extra_loops['chr1'] == chr_name) & (extra_loops['chr2'] == chr_name)].copy()
-    #     chr_schic = hic.var[hic.var['chrom'] == chr_name].copy()
-    #     chr_schic['interaction'] = chr_schic.apply(lambda row: f"{row['chromStart']}-{row['chromEnd']},{row['target_chromStart']}-{row['target_chromEnd']}", axis=1)
-    #     chr_loops['interaction'] = chr_loops.apply(lambda row: f"{row['start1']}-{row['end1']},{row['start2']}-{row['end2']}", axis=1)
-    #     print(chr_schic)
-    #     in_schic = chr_loops['interaction'].isin(chr_schic['interaction'])
-    #     chr_loops = chr_loops[in_schic].copy()
-    #     chr_loops['rank'] = chr_loops['rank'].rank(pct=True)
-    #     # scale rank to (0.5, 1) since the graph decoder uses sigmoid
-    #     chr_loops['rank'] = chr_loops['rank'] * 0.5 + 0.5
-    #     chr_loops.reset_index(drop=True, inplace=True)
-    #     chr_loops.drop(columns=['chr1', 'chr2', 'start1', 'start2', 'end1', 'end2', 'interaction'], inplace=True)
-    #     if use_ice:
-    #         chr_loops.drop(columns=['weight1', 'weight2', 'oe'], inplace=True)
-    #     print(chr_loops)
-    #     loop_dfs.append(chr_loops)
-    # extra_loops = pd.concat(loop_dfs).reset_index(drop=True)
-    # print(extra_loops)
-    # loops = pd.concat([loops, extra_loops]).drop_duplicates(subset=['bin1_id', 'bin2_id']).reset_index(drop=True)
-    # print(loops)
 
     
     genes = scglue.genomics.Bed(rna.var.assign(name=rna.var_names))

@@ -3,25 +3,14 @@ import anndata as ad
 import networkx as nx
 import scanpy as sc
 import scglue
-from cooler._logging import set_verbosity_level
-from matplotlib import rcParams
 import sys
-import math
-import itertools
 import argparse
 import numpy as np 
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.colors import LogNorm
-from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-from tqdm import tqdm
 from scipy.stats import pearsonr
-from multiprocessing import Pool
 from sklearn.metrics import accuracy_score, adjusted_rand_score, silhouette_score
-from networkx.algorithms.bipartite import biadjacency_matrix
-from score.sc_args import parse_args
-from score.utils.utils import anchor_to_locus, anchor_list_to_dict, sorted_nicely
 from preprocess_data import preprocess_higlue
 
 if __name__ == '__main__':
@@ -351,8 +340,23 @@ if __name__ == '__main__':
                                         use_obs_names=True if 'methyl' in coassay else False)
         print(f"Total nodes in prior: {len(prior.nodes)}")
 
+        print(rna.obs_names)
+        print(hic.obs_names)
         rna.obs_names_make_unique()
         hic.obs_names_make_unique()
+        if coassay is not None:
+            # get the number of paired cells
+            paired_obs = set()
+            for assay in coassay:
+                if assay == 'rna':
+                    paired_obs = paired_obs.union(set(rna.obs_names).intersection(set(hic.obs_names)))
+                elif assay == 'hic':
+                    paired_obs = paired_obs.union(set(hic.obs_names).intersection(set(rna.obs_names)))
+                elif assay == 'atac' and atac_file is not None:
+                    paired_obs = paired_obs.union(set(atac.obs_names).intersection(set(rna.obs_names)))
+                elif assay == 'methyl' and methyl_file is not None:
+                    paired_obs = paired_obs.union(set(methyl.obs_names).intersection(set(rna.obs_names)))
+            print(f"Number of paired cells: {len(paired_obs)}")
         if atac_file is not None:
             atac.obs_names_make_unique()
         if methyl_file is not None:
