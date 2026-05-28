@@ -1,4 +1,5 @@
 import os
+import re
 import anndata as ad
 import networkx as nx
 import scanpy as sc
@@ -8,10 +9,142 @@ import argparse
 import numpy as np 
 import pandas as pd
 import matplotlib.pyplot as plt
+import torch
 
+from matplotlib.colors import Normalize
 from scipy.stats import pearsonr
 from sklearn.metrics import accuracy_score, adjusted_rand_score, silhouette_score
 from preprocess_data import preprocess_higlue
+
+
+def _sanitize_plot_name(name):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "gene"
+
+
+def _resolve_gene_indices(var_names, gene_list):
+    var_name_lookup = {}
+    for var_name in var_names:
+        var_name_lookup.setdefault(str(var_name).lower(), []).append(var_name)
+
+    resolved = []
+    missing = []
+    ambiguous = []
+    for gene_name in gene_list or []:
+        if gene_name in var_names:
+            resolved_name = gene_name
+        else:
+            matches = var_name_lookup.get(str(gene_name).lower(), [])
+            if len(matches) == 1:
+                resolved_name = matches[0]
+            elif len(matches) > 1:
+                ambiguous.append((gene_name, matches))
+                continue
+            else:
+                missing.append(gene_name)
+                continue
+        resolved.append((gene_name, resolved_name, int(var_names.get_loc(resolved_name))))
+    return resolved, missing, ambiguous
+
+
+@torch.no_grad()
+def _decode_selected_rna_features(glue_model, source_key, source_adata, graph, gene_indices, batch_size=128):
+    if not gene_indices:
+        return np.empty((source_adata.shape[0], 0), dtype=np.float32)
+
+    net = glue_model.net
+    device = net.device
+    net.eval()
+
+    latent = glue_model.encode_data(source_key, source_adata, batch_size=batch_size)
+    feature_embeddings = glue_model.encode_graph(graph)
+    rna_feature_index = getattr(net, "rna_idx")
+    if torch.is_tensor(rna_feature_index):
+        rna_feature_index = rna_feature_index.detach().cpu().numpy()
+    else:
+        rna_feature_index = np.asarray(rna_feature_index)
+    feature_embeddings = feature_embeddings[rna_feature_index]
+    feature_embeddings = torch.as_tensor(feature_embeddings, dtype=torch.float32, device=device)
+    decoder = net.u2x["rna"]
+
+    target_batch_key = glue_model.modalities["rna"]["use_batch"]
+    target_batches = glue_model.modalities["rna"]["batches"]
+    if target_batch_key and target_batch_key in source_adata.obs:
+        batch_codes = target_batches.get_indexer(source_adata.obs[target_batch_key])
+        batch_codes = np.where(batch_codes < 0, 0, batch_codes)
+    else:
+        batch_codes = np.zeros(source_adata.shape[0], dtype=int)
+
+    decoded = []
+    for start in range(0, latent.shape[0], batch_size):
+        stop = min(start + batch_size, latent.shape[0])
+        latent_batch = torch.as_tensor(latent[start:stop], dtype=torch.float32, device=device)
+        batch_codes_batch = torch.as_tensor(batch_codes[start:stop], dtype=torch.int64, device=device)
+        target_libsize = torch.ones((stop - start, 1), dtype=torch.float32, device=device)
+        decoded.append(
+            decoder(latent_batch, feature_embeddings, batch_codes_batch, target_libsize)
+            .mean[:, gene_indices]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+    return np.vstack(decoded)
+
+
+def _plot_overlay_umap(adata, values, title, output_path):
+    coords = adata.obsm.get("X_umap")
+    if coords is None:
+        raise ValueError("UMAP coordinates not found in AnnData object.")
+
+    values = np.asarray(values, dtype=float)
+    finite_mask = np.isfinite(values)
+    if not finite_mask.any():
+        print(f"Skipping {title}: no finite values available.")
+        return False
+
+    plot_coords = coords[finite_mask]
+    plot_values = values[finite_mask]
+    order = np.argsort(plot_values)
+    plot_coords = plot_coords[order]
+    plot_values = plot_values[order]
+
+    if np.allclose(plot_values, plot_values[0]):
+        vmin = float(plot_values[0])
+        vmax = float(plot_values[0] + 1e-6)
+    else:
+        vmin, vmax = np.nanpercentile(plot_values, [1, 99])
+        if vmax <= vmin:
+            vmin = float(np.nanmin(plot_values))
+            vmax = float(np.nanmax(plot_values))
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+
+    norm = Normalize(vmin=vmin, vmax=vmax)
+    normalized_values = np.clip(norm(plot_values), 0.0, 1.0)
+    colors = plt.cm.magma(normalized_values)
+    colors[:, 3] = 0.08 + 0.92 * normalized_values
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    ax.scatter(coords[:, 0], coords[:, 1], s=10, c="lightgray", alpha=0.3, linewidths=0, rasterized=True)
+    scatter = ax.scatter(
+        plot_coords[:, 0], plot_coords[:, 1], s=12, c=colors, linewidths=0, rasterized=True
+    )
+    scatter.set_clim(vmin, vmax)
+    ax.set_title(title)
+    ax.set_xlabel("UMAP1")
+    ax.set_ylabel("UMAP2")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.grid(False)
+
+    scalar_mappable = plt.cm.ScalarMappable(norm=norm, cmap="magma")
+    scalar_mappable.set_array([])
+    colorbar = fig.colorbar(scalar_mappable, ax=ax, fraction=0.046, pad=0.04)
+    colorbar.set_label("Predicted transcriptional activity")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return True
 
 if __name__ == '__main__':
     glue_parser = argparse.ArgumentParser()
@@ -152,11 +285,15 @@ if __name__ == '__main__':
             methyl = ad.read_h5ad(f"{out_dir}/methyl/methyl_{full_file_suffix}.h5ad")
         hic = ad.read_h5ad(f"{out_dir}/hic/hic_{full_file_suffix}.h5ad")
         try:
-            hic.obs.loc[hic.obs_names.str.startswith('alpha_'), 'celltype'] = 'Alpha'
+            hic.obs.loc[
+                hic.obs_names.str.contains('alpha', case=False, regex=False, na=False), 'celltype'
+            ] = 'Alpha'
         except Exception as e:
             print(e)
         try:
-            hic.obs.loc[hic.obs_names.str.startswith('beta_'), 'celltype'] = 'Beta'
+            hic.obs.loc[
+                hic.obs_names.str.contains('beta', case=False, regex=False, na=False), 'celltype'
+            ] = 'Beta'
         except Exception as e:
             print(e)
 
@@ -524,14 +661,12 @@ if __name__ == '__main__':
             print(e)
             pass
         
-        if methyl_file is not None and atac_file is not None:
-            combined = ad.concat([rna, hic, atac, methyl])
-        elif methyl_file is not None:
-            combined = ad.concat([rna, hic, methyl])
-        elif atac_file is not None:
-            combined = ad.concat([rna, hic, atac])
-        else:
-            combined = ad.concat([rna, hic])
+        combined_modalities = [("rna", rna), ("hic", hic)]
+        if atac_file is not None:
+            combined_modalities.append(("atac", atac))
+        if methyl_file is not None:
+            combined_modalities.append(("methyl", methyl))
+        combined = ad.concat([adata for _, adata in combined_modalities])
 
         sc.pp.neighbors(hic, use_rep="X_glue", metric="cosine", n_neighbors=n_neighbors)
         sc.tl.umap(hic)
@@ -549,6 +684,46 @@ if __name__ == '__main__':
         plt.close()
         if use_wandb:
             wandb.log({"joint_umap": wandb.Image('glue_joint_umap.png')})
+
+        if args.gene_list:
+            configured_rna_features = pd.Index(rna.uns[scglue.config.ANNDATA_KEY]["features"])
+            resolved_genes, missing_genes, ambiguous_genes = _resolve_gene_indices(configured_rna_features, args.gene_list)
+            for missing_gene in missing_genes:
+                print(f"Skipping gene {missing_gene}: not found in configured RNA decoder features.")
+            for ambiguous_gene, matches in ambiguous_genes:
+                print(f"Skipping gene {ambiguous_gene}: ambiguous matches {matches}.")
+
+            if resolved_genes:
+                gene_plot_dir = f"{out_dir}/predicted_transcription_activity"
+                os.makedirs(gene_plot_dir, exist_ok=True)
+                gene_indices = [gene_index for _, _, gene_index in resolved_genes]
+                decoded_activity = {}
+                for modality_name, modality_data in combined_modalities:
+                    decoded_activity[modality_name] = _decode_selected_rna_features(
+                        glue, modality_name, modality_data, prior, gene_indices, batch_size=batch_size
+                    )
+
+                for gene_position, (requested_gene, resolved_gene, _) in enumerate(resolved_genes):
+                    combined_gene_activity = np.concatenate([
+                        decoded_activity[modality_name][:, gene_position]
+                        for modality_name, _ in combined_modalities
+                    ])
+                    gene_label = resolved_gene if requested_gene == resolved_gene else f"{requested_gene} ({resolved_gene})"
+                    output_path = os.path.join(
+                        gene_plot_dir,
+                        f"{_sanitize_plot_name(requested_gene)}_predicted_transcriptional_activity_umap.png"
+                    )
+                    if _plot_overlay_umap(
+                        combined,
+                        combined_gene_activity,
+                        f"{gene_label} predicted transcriptional activity",
+                        output_path
+                    ):
+                        print(f"Saved predicted transcriptional activity UMAP for {gene_label} to {output_path}")
+                        if use_wandb:
+                            wandb.log({
+                                f"predicted_transcriptional_activity_{_sanitize_plot_name(requested_gene)}": wandb.Image(output_path)
+                            })
 
         # if any cells are paired, check their embedding distance
         avg_paired_dist = 0
@@ -710,22 +885,29 @@ if __name__ == '__main__':
         #combined.write(f"{out_dir}/combined_embedding/combined_{full_file_suffix}.h5ad", compression="gzip")
 
         if 'islet' in dataset_name:
-            sorted_hic = hic[hic.obs_names.str.startswith('alpha_') | hic.obs_names.str.startswith('beta_')]
+            sorted_hic = hic[
+                hic.obs_names.str.contains('alpha', case=False, regex=False, na=False)
+                | hic.obs_names.str.contains('beta', case=False, regex=False, na=False)
+            ]
             sorted_rna = rna[rna.obs['celltype'].isin(['Alpha', 'Beta'])]
             sorted_hic.obs['sorted_celltype'] = sorted_hic.obs['celltype']
             celltypes = sorted(sorted_hic.obs['celltype'].unique())
             celltype_map = {c: i for i, c in enumerate(celltypes)}
             sorted_hic.obs['celltype_int'] = sorted_hic.obs['celltype'].map(celltype_map)
-            scglue.data.transfer_labels(sorted_rna, sorted_hic, "celltype", use_rep="X_glue", n_neighbors=5, key_added="pred_celltype_sorted")
-            sorted_hic.obs['pred_celltype_int'] = sorted_hic.obs['pred_celltype_sorted'].map(celltype_map)
-            # measure accuracy
-            val_accuracy = accuracy_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
-            val_ari = adjusted_rand_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
-            if use_wandb:
-                wandb.log({"val_accuracy": val_accuracy, "val_ari": val_ari})
-            val_celltype_asw = silhouette_score(sorted_hic.obsm['X_glue'], sorted_hic.obs['celltype_int'])
-            if use_wandb:
-                wandb.log({"val_celltype_asw": val_celltype_asw})
+            try:
+                scglue.data.transfer_labels(sorted_rna, sorted_hic, "celltype", use_rep="X_glue", n_neighbors=5, key_added="pred_celltype_sorted")
+                sorted_hic.obs['pred_celltype_int'] = sorted_hic.obs['pred_celltype_sorted'].map(celltype_map)
+                # measure accuracy
+                val_accuracy = accuracy_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
+                val_ari = adjusted_rand_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
+                if use_wandb:
+                    wandb.log({"val_accuracy": val_accuracy, "val_ari": val_ari})
+                val_celltype_asw = silhouette_score(sorted_hic.obsm['X_glue'], sorted_hic.obs['celltype_int'])
+                if use_wandb:
+                    wandb.log({"val_celltype_asw": val_celltype_asw})
+            except Exception as e:
+                print(e)
+                pass
 
         if use_wandb:
             wandb.finish()

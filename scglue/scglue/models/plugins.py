@@ -215,7 +215,7 @@ class LRScheduler(TrainingPlugin):
         if patience is None:
             raise ValueError("`patience` must be specified!")
         self.schedulers = [
-            ReduceLROnPlateau(optim, patience=patience, verbose=True, factor=factor)
+            ReduceLROnPlateau(optim, patience=patience, factor=factor)
             for optim in optims
         ]
         # self.schedulers = [
@@ -262,6 +262,8 @@ class EmbeddingVisualizer(TrainingPlugin):
             hic, hic_data_config,
             graph, vertices,
             features_ad: ad.AnnData,
+            atac=None, atac_data_config=None,
+            methyl=None, methyl_data_config=None,
             latent_dim=64,
             prefix='pretrain',
             out_dir: str = 'tmp_imgs',
@@ -272,13 +274,17 @@ class EmbeddingVisualizer(TrainingPlugin):
         self.rna_data_config = rna_data_config
         self.hic = hic
         self.hic.obs['sorted_celltype'] = self.hic.obs['celltype']
+        self.atac = atac
+        self.atac_data_config = atac_data_config
+        self.methyl = methyl
+        self.methyl_data_config = methyl_data_config
         self.graph = graph
         self.vertices = pd.Index(vertices)
         self.features_ad = features_ad
         self.alpha_beta_val = False
-        if self.hic.obs_names.str.startswith('alpha_').any() or self.hic.obs_names.str.startswith('beta_').any():
-            sorted_alpha_mask = self.hic.obs_names.str.startswith('alpha_')
-            sorted_beta_mask = self.hic.obs_names.str.startswith('beta_')
+        sorted_alpha_mask = self.hic.obs_names.str.contains('alpha', case=False, regex=False, na=False)
+        sorted_beta_mask = self.hic.obs_names.str.contains('beta', case=False, regex=False, na=False)
+        if sorted_alpha_mask.any() or sorted_beta_mask.any():
             # convert back to str
             self.hic.obs['sorted_celltype'] = self.hic.obs['sorted_celltype'].astype(str)
             self.hic.obs.loc[sorted_alpha_mask, 'sorted_celltype'] = 'alpha (sorted)'
@@ -354,6 +360,48 @@ class EmbeddingVisualizer(TrainingPlugin):
                     result.append(u.mean.detach().cpu())
                 result = torch.cat(result).numpy()
                 self.rna.obsm['X_glue'] = result
+
+                if self.atac is not None:
+                    # get atac embeddings
+                    encoder = net.x2u['atac']
+                    data = AnnDataset([self.atac], [self.atac_data_config], mode='eval', getitem_size=128)
+                    data_loader = DataLoader(
+                        data, batch_size=1, shuffle=False,
+                        num_workers=config.DATALOADER_NUM_WORKERS,
+                        pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY, drop_last=False,
+                        persistent_workers=False
+                    )
+                    result = []
+                    for x, xrep, *_ in data_loader:
+                        u = encoder(
+                            x.to(net.device, non_blocking=True),
+                            xrep.to(net.device, non_blocking=True),
+                            lazy_normalizer=True
+                        )[0]
+                        result.append(u.mean.detach().cpu())
+                    result = torch.cat(result).numpy()
+                    self.atac.obsm['X_glue'] = result
+
+                if self.methyl is not None:
+                    # get methyl embeddings
+                    encoder = net.x2u['methyl']
+                    data = AnnDataset([self.methyl], [self.methyl_data_config], mode='eval', getitem_size=128)
+                    data_loader = DataLoader(
+                        data, batch_size=1, shuffle=False,
+                        num_workers=config.DATALOADER_NUM_WORKERS,
+                        pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY, drop_last=False,
+                        persistent_workers=False
+                    )
+                    result = []
+                    for x, xrep, *_ in data_loader:
+                        u = encoder(
+                            x.to(net.device, non_blocking=True),
+                            xrep.to(net.device, non_blocking=True),
+                            lazy_normalizer=True
+                        )[0]
+                        result.append(u.mean.detach().cpu())
+                    result = torch.cat(result).numpy()
+                    self.methyl.obsm['X_glue'] = result
 
                 # get feature embeddings
                 print('Embedding features...')
@@ -435,6 +483,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                 else:
                     example_genes = []
                     example_genes = ['Gad1', 'Gad2', 'Rorb']
+                    example_genes = ['Gad1']
 
                 heatmap_out_dir = f'{self.out_dir}/heatmaps'
                 celltype_heatmaps_out_dir = f'{self.out_dir}/celltype_heatmaps'
@@ -635,10 +684,12 @@ class EmbeddingVisualizer(TrainingPlugin):
                             v = strata_ad.X
                             v = torch.as_tensor(v, device=net.device)
                             #key_conv = net.u2x['hic'].key_convs[k]
-                            v = net.u2x['hic'].prenorm_layers[k](v)
-                            qk = net.u2x['hic'].key_layers[k](v)
-                            v = net.u2x['hic'].value_layers[k](v)
-                            feats = net.u2x['hic'].attn_layers[k](qk, qk, v)
+                            prenorm = net.u2x['hic'].prenorm_layers[k](v)
+                            qk = net.u2x['hic'].key_layers[k](prenorm)
+                            v = net.u2x['hic'].value_layers[k](prenorm)
+                            key = v + net.u2x['hic'].attn_layers[k](qk, qk, prenorm)
+                            key = key + net.u2x['hic'].ff_activations[k - 1](net.u2x['hic'].ff_layers[k - 1](net.u2x['hic'].postnorm_layers[k - 1](key)))
+                            feats = key
                             attn_mat = torch.matmul(qk[strata_ad_mask, :], qk[strata_ad_mask, :].T) / math.sqrt(qk[strata_ad_mask, :].shape[1])
                             attn_mats.append(attn_mat.detach().cpu().numpy())
                             #feats = key_conv(v.t()).t()
@@ -698,12 +749,9 @@ class EmbeddingVisualizer(TrainingPlugin):
                         plt.close()
 
                         # compare attention maps with celltype heatmap reconstructions
-                        print(self.hic.var_names[:10])
                         hic_neighborhood_ad = neighborhood_ad[neighborhood_ad.obs['type'] == 'Hi-C', :]
-                        print(hic_neighborhood_ad.obs.head())
                         hic_sources = self.hic.var.apply(lambda row: f"{row['chrom']}:{row['chromStart']}-{row['chromEnd']}", axis=1)
                         hic_mask = hic_sources.isin(hic_neighborhood_ad.obs.index)
-                        print(hic_mask.sum())
                         #hic_mask = (self.hic.var['chrom'] == locus['chrom']) & (self.hic.var['chromStart'] >= locus['chromStart'] - heatmap_range) & (self.hic.var['chromStart'] <= locus['chromStart'] + heatmap_range)
                         hic_feats = self.hic.var.loc[hic_mask]
                         hic_feat_names = self.hic.var_names[hic_mask]
@@ -762,60 +810,6 @@ class EmbeddingVisualizer(TrainingPlugin):
                         mean_attn_corr, _ = pearsonr(softmax(max_attn, axis=1).flatten(), softmax(mat, axis=1).flatten())
                         gene_attention_corrs[g] = mean_attn_corr
 
-                        # plot celltype heatmaps
-                        fig, axs = plt.subplots(2, len(self.rna.obs['celltype'].unique()), figsize=(6 * len(self.rna.obs['celltype'].unique()), 6))
-                        vmax = np.max(mat)
-                        for celltype_i, celltype in enumerate(sorted(self.rna.obs['celltype'].unique())):
-                            celltype_mask = self.rna.obs['celltype'] == celltype
-                            celltype_rna = self.rna[celltype_mask]
-                            #celltype_original_pixels = self.rna.layers['counts'][celltype_mask, :]
-                            try:
-                                celltype_pred_pixels = self.rna.obsm['X_pred_hic'][celltype_mask, :]
-                                celltype_mat = np.zeros((mat_size, mat_size))
-                                #celltype_original_mat = np.zeros((mat_size, mat_size))
-                                celltype_std_mat = np.zeros((mat_size, mat_size))   
-
-                                for pixel_i in range(len(hic_feat_names)):
-                                    pixel = hic_feats.iloc[pixel_i]
-                                    pixel_name = hic_feat_names[pixel_i]
-
-                                    # row is integer index from hic_neighborhood_ad
-                                    if pixel_name[-2] == '-' or pixel_name[-3] == '-':
-                                        row = hic_neighborhood_ad.obs.index.get_loc(pixel_name[:pixel_name.rfind('-')])
-                                    else:
-                                        row = hic_neighborhood_ad.obs.index.get_loc(pixel_name)
-                                    col = row
-                                    if pixel_name[-2] == '-' or pixel_name[-3] == '-':
-                                        col += int(pixel_name.split('-')[-1])
-                                    try:
-                                        celltype_mat[row, col] = celltype_pred_pixels[:, pixel_i].mean()
-                                        #celltype_original_mat[row, col] = celltype_original_pixels[:, pixel_i].mean()
-                                        #celltype_original_mat[col, row] = celltype_original_mat[row, col]
-                                        celltype_mat[col, row] = celltype_mat[row, col]
-                                        celltype_std_mat[row, col] = celltype_pred_pixels[:, pixel_i].std()
-                                        celltype_std_mat[col, row] = celltype_std_mat[row, col]
-                                    except Exception as e:
-                                        continue
-                                sns.heatmap(celltype_mat, ax=axs[0][celltype_i], cmap='Reds', square=True, norm=PowerNorm(gamma=0.5), cbar=False, vmin=0, vmax=vmax)
-                                axs[0][celltype_i].set_title(celltype)
-                                axs[0][celltype_i].set_xticks([])
-                                axs[0][celltype_i].set_yticks([])
-                                sns.heatmap(celltype_std_mat, ax=axs[1][celltype_i], cmap='Greens', square=True, cbar=False)
-                                axs[1][celltype_i].set_title(f'{celltype} Std')
-                                axs[1][celltype_i].set_xticks([])
-                                axs[1][celltype_i].set_yticks([])
-                                # compute celltype attention correlation
-                                celltype_corr, _ = pearsonr(softmax(max_attn, axis=1).flatten(), softmax(celltype_mat, axis=1).flatten())
-                                celltype_gene_attention_corrs[celltype + '_' + g] = celltype_corr
-                                print(f'{celltype} attention correlation: {celltype_corr}')
-                            except Exception as e:
-                                print(e)
-                                continue
-
-                        plt.tight_layout()
-                        plt.savefig(f'{celltype_heatmaps_out_dir}/{self.prefix}_hic_heatmap_{g}_{save_i}.png')
-                        plt.close()
-
                         ax = sc.pl.pca(per_strata_ad, color=["type"], show=False)
                         texts = []
                         n_labels = 0
@@ -861,6 +855,10 @@ class EmbeddingVisualizer(TrainingPlugin):
 
 
                 transfer_labels(self.rna, self.hic, "celltype", use_rep="X_glue", n_neighbors=10, key_added="pred_celltype")
+                if self.atac is not None:
+                    transfer_labels(self.rna, self.atac, "celltype", use_rep="X_glue", n_neighbors=10, key_added="pred_celltype")
+                if self.methyl is not None:
+                    transfer_labels(self.rna, self.methyl, "celltype", use_rep="X_glue", n_neighbors=10, key_added="pred_celltype")
 
                 # compute pca
                 pca_out_dir = f'{self.out_dir}/pca'
@@ -874,6 +872,18 @@ class EmbeddingVisualizer(TrainingPlugin):
                 self.hic.obs['agglomerative'] = AgglomerativeClustering(n_clusters=len(self.hic.obs['celltype'].unique())).fit_predict(self.hic.obsm['X_glue'])
                 # set leiden to int to avoid clash with colormap
                 self.hic.obs['leiden'] = self.hic.obs['leiden'].astype(int)
+
+                if self.atac is not None:
+                    sc.tl.leiden(self.atac)
+                    #self.atac.obs['kmeans'] = KMeans(n_clusters=len(self.atac.obs['celltype'].unique())).fit_predict(self.atac.obsm['X_glue'])
+                    self.atac.obs['agglomerative'] = AgglomerativeClustering(n_clusters=len(self.atac.obs['celltype'].unique())).fit_predict(self.atac.obsm['X_glue'])
+                    self.atac.obs['leiden'] = self.atac.obs['leiden'].astype(int)
+
+                if self.methyl is not None:
+                    sc.tl.leiden(self.methyl)
+                    #self.methyl.obs['kmeans'] = KMeans(n_clusters=len(self.methyl.obs['celltype'].unique())).fit_predict(self.methyl.obsm['X_glue'])
+                    self.methyl.obs['agglomerative'] = AgglomerativeClustering(n_clusters=len(self.methyl.obs['celltype'].unique())).fit_predict(self.methyl.obsm['X_glue'])
+                    self.methyl.obs['leiden'] = self.methyl.obs['leiden'].astype(int)
 
                 wspace = 0.45
                 palette = None
@@ -914,12 +924,52 @@ class EmbeddingVisualizer(TrainingPlugin):
                 fig.savefig(f'{umap_out_dir}/{self.prefix}_umap_{save_i}.png')
                 plt.close()
 
+                if self.atac is not None:
+                    # also visualize atac embeddings
+                    x_pca = PCA(n_components=2).fit_transform(self.atac.obsm['X_glue'])
+                    self.atac.obsm['X_pca'] = x_pca
+                    atac_pca_out_dir = f'{self.out_dir}/atac/pca'
+                    os.makedirs(atac_pca_out_dir, exist_ok=True)
+                    sc.set_figure_params()
+                    fig = sc.pl.pca(self.atac, color=["celltype", "pred_celltype", "batch"], ncols=3, wspace=wspace, return_fig=True)
+                    fig.savefig(f'{atac_pca_out_dir}/{self.prefix}_pca_atac_{save_i}.png')
+                    plt.close()
+                    sc.pp.neighbors(self.atac, use_rep="X_glue", metric="cosine")
+                    sc.tl.umap(self.atac)
+                    atac_umap_out_dir = f'{self.out_dir}/atac/umap'
+                    os.makedirs(atac_umap_out_dir, exist_ok=True)
+                    fig = sc.pl.umap(self.atac, color=["celltype", "pred_celltype", "batch"], ncols=3, wspace=wspace, return_fig=True)
+                    fig.savefig(f'{atac_umap_out_dir}/{self.prefix}_umap_atac_{save_i}.png')
+                    plt.close()
+
+                if self.methyl is not None:
+                    # also visualize methyl embeddings
+                    x_pca = PCA(n_components=2).fit_transform(self.methyl.obsm['X_glue'])
+                    self.methyl.obsm['X_pca'] = x_pca
+                    methyl_pca_out_dir = f'{self.out_dir}/methyl/pca'
+                    os.makedirs(methyl_pca_out_dir, exist_ok=True)
+                    sc.set_figure_params()
+                    fig = sc.pl.pca(self.methyl, color=["celltype", "pred_celltype", "batch"], ncols=3, wspace=wspace, return_fig=True)
+                    fig.savefig(f'{methyl_pca_out_dir}/{self.prefix}_pca_methyl_{save_i}.png')
+                    plt.close()
+                    sc.pp.neighbors(self.methyl, use_rep="X_glue", metric="cosine")
+                    sc.tl.umap(self.methyl)
+                    methyl_umap_out_dir = f'{self.out_dir}/methyl/umap'
+                    os.makedirs(methyl_umap_out_dir, exist_ok=True)
+                    fig = sc.pl.umap(self.methyl, color=["celltype", "pred_celltype", "batch"], ncols=3, wspace=wspace, return_fig=True)
+                    fig.savefig(f'{methyl_umap_out_dir}/{self.prefix}_umap_methyl_{save_i}.png')
+                    plt.close()
+
                 # if rna dataset is small enough, visualize joint embeddings
                 if self.rna.shape[0] < 5000:
                     self.hic.obs['domain'] = 'hic'
                     self.rna.obs['domain'] = 'rna'
                     self.rna.obs['pred_celltype'] = self.rna.obs['celltype']
-                    combined = ad.concat([self.hic, self.rna])
+                    if self.atac is not None:
+                        self.atac.obs['domain'] = 'atac'
+                        combined = ad.concat([self.hic, self.rna, self.atac])
+                    else:
+                        combined = ad.concat([self.hic, self.rna])
                     # compute pca
                     pca_out_dir = f'{self.out_dir}/joint/pca'
                     os.makedirs(pca_out_dir, exist_ok=True)
@@ -947,6 +997,19 @@ class EmbeddingVisualizer(TrainingPlugin):
                 self.hic.obs['celltype_int'] = self.hic.obs['celltype'].map(celltype_map)
                 self.hic.obs['pred_celltype'] = self.hic.obs['pred_celltype'].apply(lambda s: s if s in celltypes else 'Other')
                 self.hic.obs['pred_celltype_int'] = self.hic.obs['pred_celltype'].map(celltype_map)
+                if self.atac is not None:
+                    atac_celltypes = list(sorted(self.atac.obs['celltype'].unique())) + ['Other']
+                    atac_celltype_map = {c: i for i, c in enumerate(atac_celltypes)}
+                    self.atac.obs['celltype_int'] = self.atac.obs['celltype'].map(atac_celltype_map)
+                    self.atac.obs['pred_celltype'] = self.atac.obs['pred_celltype'].apply(lambda s: s if s in rna_celltypes else 'Other')
+                    self.atac.obs['pred_celltype_int'] = self.atac.obs['pred_celltype'].map(rna_celltype_map)
+
+                if self.methyl is not None:
+                    methyl_celltypes = list(sorted(self.methyl.obs['celltype'].unique())) + ['Other']
+                    methyl_celltype_map = {c: i for i, c in enumerate(methyl_celltypes)}
+                    self.methyl.obs['celltype_int'] = self.methyl.obs['celltype'].map(methyl_celltype_map)
+                    self.methyl.obs['pred_celltype'] = self.methyl.obs['pred_celltype'].apply(lambda s: s if s in rna_celltypes else 'Other')
+                    self.methyl.obs['pred_celltype_int'] = self.methyl.obs['pred_celltype'].map(rna_celltype_map)
 
                 confusion_matrix_out_dir = f'{self.out_dir}/confusion_matrix'
                 os.makedirs(confusion_matrix_out_dir, exist_ok=True)
@@ -982,6 +1045,46 @@ class EmbeddingVisualizer(TrainingPlugin):
                 except ValueError:  # not enough clusters
                     sil_celltype = 0
 
+                if self.atac is not None:
+                    atac_ari_leiden = adjusted_rand_score(self.atac.obs['celltype_int'], self.atac.obs['leiden'])
+                    atac_ari_kmeans = adjusted_rand_score(self.atac.obs['celltype_int'], self.atac.obs['agglomerative'])
+                    try:
+                        atac_sil_score_leiden = silhouette_score(self.atac.obsm['X_glue'], self.atac.obs['leiden'])
+                    except ValueError:  # not enough clusters
+                        atac_sil_score_leiden = 0
+                    try:
+                        atac_sil_score_kmeans = silhouette_score(self.atac.obsm['X_glue'], self.atac.obs['agglomerative'])
+                    except ValueError:  # not enough clusters
+                        atac_sil_score_kmeans = 0
+                    try:
+                        atac_sil_score_joint = silhouette_score(self.atac.obsm['X_glue'], self.atac.obs['pred_celltype_int'])
+                    except ValueError:  # not enough clusters
+                        atac_sil_score_joint = 0
+                    try:
+                        atac_sil_celltype = silhouette_score(self.atac.obsm['X_glue'], self.atac.obs['celltype_int'])
+                    except ValueError:  # not enough clusters
+                        atac_sil_celltype = 0   
+
+                if self.methyl is not None:
+                    methyl_ari_leiden = adjusted_rand_score(self.methyl.obs['celltype_int'], self.methyl.obs['leiden'])
+                    methyl_ari_kmeans = adjusted_rand_score(self.methyl.obs['celltype_int'], self.methyl.obs['agglomerative'])
+                    try:
+                        methyl_sil_score_leiden = silhouette_score(self.methyl.obsm['X_glue'], self.methyl.obs['leiden'])
+                    except ValueError:  # not enough clusters
+                        methyl_sil_score_leiden = 0
+                    try:
+                        methyl_sil_score_kmeans = silhouette_score(self.methyl.obsm['X_glue'], self.methyl.obs['agglomerative'])
+                    except ValueError:  # not enough clusters
+                        methyl_sil_score_kmeans = 0
+                    try:
+                        methyl_sil_score_joint = silhouette_score(self.methyl.obsm['X_glue'], self.methyl.obs['pred_celltype_int'])
+                    except ValueError:  # not enough clusters
+                        methyl_sil_score_joint = 0
+                    try:
+                        methyl_sil_celltype = silhouette_score(self.methyl.obsm['X_glue'], self.methyl.obs['celltype_int'])
+                    except ValueError:  # not enough clusters
+                        methyl_sil_celltype = 0 
+
                 # measure ari in joint embedding space (usually better than in Hi-C only space)
                 ari_joint = adjusted_rand_score(self.hic.obs['celltype_int'], self.hic.obs['pred_celltype_int'])
                 f1_micro = f1_score(self.hic.obs['celltype_int'], self.hic.obs['pred_celltype_int'], average='micro', labels=list(range(len(celltypes))))
@@ -989,12 +1092,29 @@ class EmbeddingVisualizer(TrainingPlugin):
                 accuracy = accuracy_score(self.hic.obs['celltype_int'], self.hic.obs['pred_celltype_int'])
                 balanced_accuracy = balanced_accuracy_score(self.hic.obs['celltype_int'], self.hic.obs['pred_celltype_int'])
 
+                if self.atac is not None:
+                    atac_ari_joint = adjusted_rand_score(self.atac.obs['celltype_int'], self.atac.obs['pred_celltype_int'])
+                    atac_f1_micro = f1_score(self.atac.obs['celltype_int'], self.atac.obs['pred_celltype_int'], average='micro', labels=list(range(len(celltypes))))
+                    atac_f1_macro = f1_score(self.atac.obs['celltype_int'], self.atac.obs['pred_celltype_int'], average='macro', labels=list(range(len(celltypes))))
+                    atac_accuracy = accuracy_score(self.atac.obs['celltype_int'], self.atac.obs['pred_celltype_int'])
+                    atac_balanced_accuracy = balanced_accuracy_score(self.atac.obs['celltype_int'], self.atac.obs['pred_celltype_int'])
+
+                if self.methyl is not None:
+                    methyl_ari_joint = adjusted_rand_score(self.methyl.obs['celltype_int'], self.methyl.obs['pred_celltype_int'])
+                    methyl_f1_micro = f1_score(self.methyl.obs['celltype_int'], self.methyl.obs['pred_celltype_int'], average='micro', labels=list(range(len(celltypes))))
+                    methyl_f1_macro = f1_score(self.methyl.obs['celltype_int'], self.methyl.obs['pred_celltype_int'], average='macro', labels=list(range(len(celltypes))))
+                    methyl_accuracy = accuracy_score(self.methyl.obs['celltype_int'], self.methyl.obs['pred_celltype_int'])
+                    methyl_balanced_accuracy = balanced_accuracy_score(self.methyl.obs['celltype_int'], self.methyl.obs['pred_celltype_int'])
+
                 val_accuracy = 0
                 val_balanced_accuracy = 0
                 val_ari = 0
                 val_celltype_asw = 0
                 if self.alpha_beta_val:
-                    sorted_hic = self.hic[self.hic.obs_names.str.startswith('alpha_') | self.hic.obs_names.str.startswith('beta_')]
+                    sorted_hic = self.hic[
+                        self.hic.obs_names.str.contains('alpha', case=False, regex=False, na=False)
+                        | self.hic.obs_names.str.contains('beta', case=False, regex=False, na=False)
+                    ]
                     sorted_rna = self.rna[self.rna.obs['celltype'].isin(['Alpha', 'Beta'])]
                     sorted_hic.obs['sorted_celltype'] = sorted_hic.obs['celltype']
                     celltypes = sorted(sorted_hic.obs['celltype'].unique())
@@ -1049,7 +1169,6 @@ class EmbeddingVisualizer(TrainingPlugin):
                     paired_rna = self.rna[self.rna.obs_names.isin(paired_hic.obs_names)].copy()
                     hic_z = paired_hic.obsm['X_glue']
                     rna_z = paired_rna.obsm['X_glue']
-                    print(hic_z.shape, rna_z.shape)
                     dists = np.linalg.norm(hic_z - rna_z, axis=1)
                     corrs = []
                     for i in range(hic_z.shape[0]):
@@ -1090,7 +1209,8 @@ class EmbeddingVisualizer(TrainingPlugin):
 
                 
                 self.logger.info(f"ARI (Hi-C only): {ari_kmeans:.2f}, ARI (joint): {ari_joint:.2f}, Accuracy (joint): {accuracy:.2f}, Balanced Accuracy (joint): {balanced_accuracy:.2f}")
-                wandb.log({f"ari_{self.prefix}": ari_kmeans, 
+                
+                log_dict = {f"ari_{self.prefix}": ari_kmeans, 
                            f"ari_leiden_{self.prefix}": ari_leiden,
                            f"ari_joint_{self.prefix}": ari_joint, 
                             f"f1_micro_{self.prefix}": f1_micro,
@@ -1108,7 +1228,41 @@ class EmbeddingVisualizer(TrainingPlugin):
                             f"silhouette_kmeans_{self.prefix}": sil_score_kmeans,
                             f"silhouette_joint_{self.prefix}": sil_score_joint,
                             f"silhouette_celltype_{self.prefix}": sil_celltype,
-                           "epoch": epoch}, step=epoch)
+                           "epoch": epoch}
+                if self.atac is not None:
+                    self.logger.info(f"Atac ARI (Leiden): {atac_ari_leiden:.2f}, Atac ARI (KMeans): {atac_ari_kmeans:.2f}, Atac ARI (joint): {atac_ari_joint:.2f}, Atac Accuracy (joint): {atac_accuracy:.2f}, Atac Balanced Accuracy (joint): {atac_balanced_accuracy:.2f}")
+                    log_dict.update({
+                           f"atac_ari_{self.prefix}": atac_ari_kmeans, 
+                           f"atac_ari_leiden_{self.prefix}": atac_ari_leiden,
+                           f"atac_ari_joint_{self.prefix}": atac_ari_joint, 
+                            f"atac_f1_micro_{self.prefix}": atac_f1_micro,
+                            f"atac_f1_macro_{self.prefix}": atac_f1_macro,
+                           f"atac_accuracy_{self.prefix}": atac_accuracy,
+                            f"atac_balanced_accuracy_{self.prefix}": atac_balanced_accuracy,
+                            f"atac_silhouette_leiden_{self.prefix}": atac_sil_score_leiden,
+                            f"atac_silhouette_kmeans_{self.prefix}": atac_sil_score_kmeans,
+                            f"atac_silhouette_joint_{self.prefix}": atac_sil_score_joint,
+                            f"atac_silhouette_celltype_{self.prefix}": atac_sil_celltype,
+                    })
+                if self.methyl is not None:
+                    self.logger.info(f"Methyl ARI (Leiden): {methyl_ari_leiden:.2f}, Methyl ARI (KMeans): {methyl_ari_kmeans:.2f}, Methyl ARI (joint): {methyl_ari_joint:.2f}, Methyl Accuracy (joint): {methyl_accuracy:.2f}, Methyl Balanced Accuracy (joint): {methyl_balanced_accuracy:.2f}")
+                    log_dict.update({
+                           f"methyl_ari_{self.prefix}": methyl_ari_kmeans, 
+                           f"methyl_ari_leiden_{self.prefix}": methyl_ari_leiden,
+                           f"methyl_ari_joint_{self.prefix}": methyl_ari_joint, 
+                            f"methyl_f1_micro_{self.prefix}": methyl_f1_micro,
+                            f"methyl_f1_macro_{self.prefix}": methyl_f1_macro,
+                           f"methyl_accuracy_{self.prefix}": methyl_accuracy,
+                            f"methyl_balanced_accuracy_{self.prefix}": methyl_balanced_accuracy,
+                            f"methyl_silhouette_leiden_{self.prefix}": methyl_sil_score_leiden,
+                            f"methyl_silhouette_kmeans_{self.prefix}": methyl_sil_score_kmeans,
+                            f"methyl_silhouette_joint_{self.prefix}": methyl_sil_score_joint,
+                            f"methyl_silhouette_celltype_{self.prefix}": methyl_sil_celltype,
+                    })
+                try:
+                    wandb.log(log_dict, step=epoch)
+                except Exception as e:
+                    self.logger.error(f"Error logging to wandb: {e}")
                 #wandb.log({**gene_attention_corrs, **celltype_gene_attention_corrs})
                 
 
