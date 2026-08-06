@@ -253,6 +253,34 @@ class LRScheduler(TrainingPlugin):
                 train_engine.state.n_lrs += 1
                 self.logger.info("Learning rate reduction: step %d", train_engine.state.n_lrs)
 
+def _embedding_only(
+        adata: ad.AnnData, keys: Iterable[str] = ("X_glue", )
+) -> ad.AnnData:
+    r"""
+    A lightweight copy of a dataset carrying only its annotations and selected
+    embeddings, so that visualizations never touch (or load) ``X``
+
+    Datasets can be backed by disk, in which case subsetting, copying or
+    concatenating them would read the whole matrix into memory (or fail).
+
+    Parameters
+    ----------
+    adata
+        Dataset to summarize
+    keys
+        ``obsm`` keys to carry over (missing ones are ignored)
+
+    Returns
+    -------
+    embedding
+        Dataset with the same ``obs`` and the requested embeddings
+    """
+    return ad.AnnData(
+        obs=adata.obs.copy(),
+        obsm={key: adata.obsm[key] for key in keys if key in adata.obsm}
+    )
+
+
 # add plugin for visualizing embeddings after each epoch
 @logged
 class EmbeddingVisualizer(TrainingPlugin):
@@ -603,6 +631,11 @@ class EmbeddingVisualizer(TrainingPlugin):
                 graph_out_dir = f'{self.out_dir}/loop_graph'
                 gene_attention_corrs = {}
                 celltype_gene_attention_corrs = {}
+                if not hasattr(net.u2x['hic'], 'prenorm_layers'):
+                    # the per-gene visualizations below inspect the attention
+                    # layers of the stratified decoder, which the
+                    # multi-resolution (convolutional) decoder does not have
+                    example_genes = []
                 try:
                     for g in example_genes:
                         try:
@@ -983,11 +1016,14 @@ class EmbeddingVisualizer(TrainingPlugin):
                     self.hic.obs['domain'] = 'hic'
                     self.rna.obs['domain'] = 'rna'
                     self.rna.obs['pred_celltype'] = self.rna.obs['celltype']
+                    # only the embeddings and annotations are needed here, and
+                    # concatenating `X` across modalities would read the whole
+                    # Hi-C matrix (impossible for backed datasets)
+                    joint = [_embedding_only(self.hic), _embedding_only(self.rna)]
                     if self.atac is not None:
                         self.atac.obs['domain'] = 'atac'
-                        combined = ad.concat([self.hic, self.rna, self.atac])
-                    else:
-                        combined = ad.concat([self.hic, self.rna])
+                        joint.append(_embedding_only(self.atac))
+                    combined = ad.concat(joint)
                     # compute pca
                     pca_out_dir = f'{self.out_dir}/joint/pca'
                     os.makedirs(pca_out_dir, exist_ok=True)
@@ -1129,10 +1165,13 @@ class EmbeddingVisualizer(TrainingPlugin):
                 val_ari = 0
                 val_celltype_asw = 0
                 if self.alpha_beta_val:
-                    sorted_hic = self.hic[
+                    sorted_mask = (
                         self.hic.obs_names.str.contains('alpha', case=False, regex=False, na=False)
                         | self.hic.obs_names.str.contains('beta', case=False, regex=False, na=False)
-                    ]
+                    )
+                    sorted_hic = _embedding_only(
+                        self.hic, keys=("X_glue", "X_pca", "X_umap")
+                    )[sorted_mask].copy()
                     sorted_rna = self.rna[self.rna.obs['celltype'].isin(['Alpha', 'Beta'])]
                     sorted_hic.obs['sorted_celltype'] = sorted_hic.obs['celltype']
                     celltypes = sorted(sorted_hic.obs['celltype'].unique())
@@ -1183,8 +1222,11 @@ class EmbeddingVisualizer(TrainingPlugin):
                 avg_paired_expr_corr = 0
                 avg_paired_dist = 0
                 if np.sum(paired_mask) > 0:
-                    paired_hic = self.hic[paired_mask, :].copy()
-                    paired_rna = self.rna[self.rna.obs_names.isin(paired_hic.obs_names)].copy()
+                    paired_keys = ("X_glue", "X_pred_rna")
+                    paired_hic = _embedding_only(self.hic, keys=paired_keys)[paired_mask].copy()
+                    paired_rna = _embedding_only(self.rna, keys=paired_keys)[
+                        self.rna.obs_names.isin(paired_hic.obs_names)
+                    ].copy()
                     hic_z = paired_hic.obsm['X_glue']
                     rna_z = paired_rna.obsm['X_glue']
                     dists = np.linalg.norm(hic_z - rna_z, axis=1)

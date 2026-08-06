@@ -873,7 +873,11 @@ if __name__ == '__main__':
         avg_paired_expr_corr = 0
         avg_paired_dist = 0
         if np.sum(paired_mask) > 0:
-            paired_hic = hic[paired_mask, :].copy()
+            # only the embeddings are compared, so avoid touching `X` (which a
+            # backed dataset cannot copy)
+            paired_hic = ad.AnnData(
+                obs=hic.obs.copy(), obsm={"X_glue": hic.obsm["X_glue"]}
+            )[paired_mask].copy()
             paired_rna = rna[rna.obs_names.isin(paired_hic.obs_names)].copy()
             hic_z = paired_hic.obsm['X_glue']
             rna_z = paired_rna.obsm['X_glue']
@@ -1026,10 +1030,14 @@ if __name__ == '__main__':
         #combined.write(f"{out_dir}/combined_embedding/combined_{full_file_suffix}.h5ad", compression="gzip")
 
         if 'islet' in dataset_name:
-            sorted_hic = hic[
+            sorted_mask = (
                 hic.obs_names.str.contains('alpha', case=False, regex=False, na=False)
                 | hic.obs_names.str.contains('beta', case=False, regex=False, na=False)
-            ]
+            )
+            # embeddings and labels only, so this also works for backed data
+            sorted_hic = ad.AnnData(
+                obs=hic.obs.copy(), obsm={"X_glue": hic.obsm["X_glue"]}
+            )[sorted_mask].copy()
             sorted_rna = rna[rna.obs['celltype'].isin(['Alpha', 'Beta'])]
             sorted_hic.obs['sorted_celltype'] = sorted_hic.obs['celltype']
             celltypes = sorted(sorted_hic.obs['celltype'].unique())

@@ -948,7 +948,10 @@ class SparseH5adWriter:
         r"""
         Write annotations and close the file
         """
-        from anndata._io.specs import write_elem
+        try:  # anndata >= 0.11
+            from anndata.io import write_elem
+        except ImportError:
+            from anndata._io.specs import write_elem
 
         if obs.shape[0] != self.n_obs:
             raise ValueError(

@@ -31,6 +31,42 @@ from .nn import get_default_numpy_dtype
 DATA_CONFIG = Mapping[str, Any]
 
 
+#------------------------------ anndata compat ---------------------------------
+
+def _sparse_dataset_types() -> tuple:
+    r"""
+    Classes used by anndata to represent a backed sparse matrix
+
+    Newer anndata versions return ``CSRDataset``/``CSCDataset`` instead of
+    ``SparseDataset``, so both are recognized.
+    """
+    types = {SparseDataset}
+    try:  # anndata >= 0.10
+        from anndata._core.sparse_dataset import BaseCompressedSparseDataset
+        types.add(BaseCompressedSparseDataset)
+    except ImportError:  # pragma: no cover
+        pass
+    return tuple(types)
+
+
+def open_sparse_dataset(group: h5py.Group) -> Any:
+    r"""
+    Open an HDF5 group as a backed sparse matrix
+    """
+    for module, name in (
+        ("anndata.io", "sparse_dataset"),
+        ("anndata.experimental", "sparse_dataset"),
+    ):
+        try:
+            return getattr(__import__(module, fromlist=[name]), name)(group)
+        except (ImportError, AttributeError):  # pragma: no cover
+            continue
+    return SparseDataset(group)
+
+
+BACKED_TYPES = (h5py.Dataset, ) + _sparse_dataset_types()
+
+
 #------------------------------- Backed matrices -------------------------------
 
 @logged
@@ -68,7 +104,7 @@ class BackedMatrix:
         self.binarize = binarize
         self.row_idx = None if row_idx is None else np.asarray(row_idx, dtype=np.int64)
         self.col_idx = None if col_idx is None else np.asarray(col_idx, dtype=np.int64)
-        self._sparse = isinstance(arr, SparseDataset)
+        self._sparse = not isinstance(arr, h5py.Dataset)
         self._filename, self._path = self._locate(arr)
         self._pid = os.getpid()
         self._arr = arr
@@ -87,7 +123,7 @@ class BackedMatrix:
         if self._arr is None or self._pid != os.getpid():
             handle = h5py.File(self._filename, "r")
             group = handle[self._path]
-            self._arr = SparseDataset(group) if self._sparse else group
+            self._arr = open_sparse_dataset(group) if self._sparse else group
             self._pid = os.getpid()
         return self._arr
 
@@ -478,7 +514,7 @@ class AnnDataset(Dataset):
 
     @staticmethod
     def _index_array(arr: AnyArray, idx: np.ndarray) -> np.ndarray:
-        if isinstance(arr, (h5py.Dataset, SparseDataset)):
+        if isinstance(arr, BACKED_TYPES):
             rank = scipy.stats.rankdata(idx, method="dense") - 1
             sorted_idx = np.empty(rank.max() + 1, dtype=int)
             sorted_idx[rank] = idx
@@ -600,7 +636,7 @@ class AnnDataset(Dataset):
             x = source.layers[use_layer]
         else:
             x = source.X
-        if isinstance(x, (h5py.Dataset, SparseDataset)):
+        if isinstance(x, BACKED_TYPES):
             # Read lazily, one minibatch at a time
             return BackedMatrix(
                 x, row_idx=row_idx, col_idx=col_idx,
