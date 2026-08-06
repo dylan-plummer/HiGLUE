@@ -14,7 +14,8 @@ import torch
 from matplotlib.colors import Normalize
 from scipy.stats import pearsonr
 from sklearn.metrics import accuracy_score, adjusted_rand_score, silhouette_score
-from preprocess_data import preprocess_higlue
+from preprocess_data import preprocess_higlue, preprocess_higlue_multires
+import multires_hic as mh
 
 
 def _sanitize_plot_name(name):
@@ -149,6 +150,7 @@ def _plot_overlay_umap(adata, values, title, output_path):
 if __name__ == '__main__':
     glue_parser = argparse.ArgumentParser()
     # preprocessing args
+    glue_parser.add_argument('--seed', type=int, default=25)
     glue_parser.add_argument('--data_dir', type=str, default='')
     glue_parser.add_argument('--loop_q', type=str, default='0.98')
     glue_parser.add_argument('--n_strata', type=int, default=10)
@@ -158,7 +160,6 @@ if __name__ == '__main__':
     glue_parser.add_argument('--load_rna', action='store_true')
     glue_parser.add_argument('--preprocess', action='store_true')
     glue_parser.add_argument('--train', action='store_true')
-    glue_parser.add_argument('--seed', type=int, default=36)
     glue_parser.add_argument('--offset', type=int, default=0)
     glue_parser.add_argument('--min_count', type=int, default=0)
     glue_parser.add_argument('--distal_interactions', type=int, default=None)
@@ -215,8 +216,76 @@ if __name__ == '__main__':
     glue_parser.add_argument('--use_atac_counts', action='store_true')
     glue_parser.add_argument('--cache_checkpoint', type=str, default=None)
 
+    # multi-resolution args
+    glue_parser.add_argument(
+        '--resolutions', nargs='+', default=None,
+        help='train a single multi-resolution model on these resolutions '
+             '(e.g. 500kb 100kb 5kb). Coarser grids are derived from the '
+             '.scool passed to SCORE, which must be the finest resolution.'
+    )
+    glue_parser.add_argument(
+        '--multires_strata', nargs='+', type=int, default=None,
+        help='number of diagonal strata per resolution (one value, or one per '
+             'resolution); defaults to --n_strata'
+    )
+    glue_parser.add_argument(
+        '--multires_max_anchors', nargs='+', type=int, default=None,
+        help='maximum number of anchors kept per resolution (0 = keep all '
+             'detected anchors); defaults to 50000'
+    )
+    glue_parser.add_argument(
+        '--multires_tile_size', type=int, default=8,
+        help='anchors are kept in contiguous tiles of this many bins'
+    )
+    glue_parser.add_argument(
+        '--multires_stat_cells', type=int, default=None,
+        help='number of cells scanned to rank anchors and contacts '
+             '(default: all cells)'
+    )
+    glue_parser.add_argument(
+        '--multires_min_frac', type=float, default=0.01,
+        help='an anchor must be detected in at least this fraction of cells'
+    )
+    glue_parser.add_argument('--multires_chunk_size', type=int, default=256)
+    glue_parser.add_argument('--multires_use_dist', action='store_true',
+                             help='also add distance-decay gene-anchor edges')
+    glue_parser.add_argument('--multires_dist_window', type=int, default=150000)
+    glue_parser.add_argument(
+        '--multires_res_dim', type=int, default=None,
+        help='dimensionality of each per-resolution cell embedding '
+             '(default: --h_dim)'
+    )
+    glue_parser.add_argument(
+        '--multires_mlp_max_band', type=int, default=262144,
+        help='resolutions whose band matrix is larger than this are encoded '
+             'with convolutions instead of a dense projection'
+    )
+    glue_parser.add_argument(
+        '--multires_anchor_subsample', type=int, default=None,
+        help='reconstruct only this many anchors per resolution in each '
+             'training step (keeps high resolution training tractable)'
+    )
+    glue_parser.add_argument('--multires_conv_channels', nargs=3, type=int,
+                             default=(8, 16, 32))
+    glue_parser.add_argument('--multires_conv_patch', nargs=2, type=int,
+                             default=(2, 8))
+    glue_parser.add_argument('--multires_conv_pool_width', type=int, default=32)
+    glue_parser.add_argument('--multires_use_attn', action='store_true')
+    glue_parser.add_argument(
+        '--multires_checkpoint', action='store_true',
+        help='recompute the per-resolution encoders during the backward pass '
+             'to trade compute for GPU memory'
+    )
+    glue_parser.add_argument(
+        '--backed', action='store_true',
+        help='read the Hi-C dataset from disk one minibatch at a time'
+    )
+
     glue_args = sys.argv.index('SCORE')
     args = glue_parser.parse_args(sys.argv[1:glue_args] + sys.argv[glue_args + 1:])
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     dataset_name = args.dset
     out_dir = f'data/{dataset_name}_data'
@@ -273,17 +342,38 @@ if __name__ == '__main__':
     atac_file = args.atac_file
     methyl_file = args.methyl_file
 
+    multires = bool(args.resolutions)
+    if multires:
+        # Resolutions are always ordered coarse to fine
+        resolutions = sorted(args.resolutions, key=mh.parse_resolution, reverse=True)
+        multires_strata = mh.broadcast_option(
+            args.multires_strata, len(resolutions), "multires_strata",
+            default=n_strata
+        )
+        multires_strata = [int(s) for s in multires_strata]
+        full_file_suffix = mh.multires_suffix(resolutions, multires_strata, float(loop_q))
+        graph_file_suffix = f"{prior_name}_prior_{full_file_suffix}"
+        print(f"Multi-resolution mode: {list(zip(resolutions, multires_strata))}")
+
     if args.preprocess:
-        preprocess_higlue(args, glue_args)
+        if multires:
+            preprocess_higlue_multires(args, glue_args)
+        else:
+            preprocess_higlue(args, glue_args)
 
     if args.train:
-        prior = nx.read_graphml(f"{out_dir}/graphs/{graph_file_suffix}.graphml.gz") 
+        prior = nx.read_graphml(f"{out_dir}/graphs/{graph_file_suffix}.graphml.gz")
         rna = ad.read_h5ad(f"{out_dir}/rna/rna_{full_file_suffix}.h5ad")
         if atac_file is not None:
             atac = ad.read_h5ad(f"{out_dir}/atac/atac_{full_file_suffix}.h5ad")
         if methyl_file is not None:
             methyl = ad.read_h5ad(f"{out_dir}/methyl/methyl_{full_file_suffix}.h5ad")
-        hic = ad.read_h5ad(f"{out_dir}/hic/hic_{full_file_suffix}.h5ad")
+        hic = ad.read_h5ad(
+            f"{out_dir}/hic/hic_{full_file_suffix}.h5ad",
+            backed="r" if args.backed else None
+        )
+        if args.backed:
+            print(f"Reading Hi-C data lazily from disk: {hic.shape}")
         try:
             hic.obs.loc[
                 hic.obs_names.str.contains('alpha', case=False, regex=False, na=False), 'celltype'
@@ -299,7 +389,15 @@ if __name__ == '__main__':
 
         rna.var["highly_variable"] = rna.var["highly_variable"] & rna.var["in_hic"]
         hic.var["highly_variable"] = True
-        hic = hic[hic.obs['depth'] > min_depth, :]
+        if args.backed:
+            # Subsetting a backed dataset would pull it into memory, so cells
+            # have to be filtered while preprocessing (SCORE's --min_depth)
+            n_shallow = int((hic.obs['depth'] <= min_depth).sum())
+            if n_shallow:
+                print(f"WARNING: keeping {n_shallow} cells with depth <= {min_depth}; "
+                      f"pass --min_depth to SCORE to drop them during preprocessing.")
+        else:
+            hic = hic[hic.obs['depth'] > min_depth, :]
         hic.obs['read_depth'] = hic.obs['depth'].copy()  # for visualization later
 
         # set depth as fraction of total counts
@@ -314,12 +412,23 @@ if __name__ == '__main__':
         # set hic depth per batch
         for batch in hic.obs['batch'].unique():
             mask = hic.obs['batch'] == batch
+            if multires:
+                # Multi-resolution data is streamed from disk, so the sequencing
+                # depth recorded during preprocessing is used directly
+                batch_depth = hic.obs.loc[mask, 'read_depth'].astype(float)
+                hic.obs.loc[mask, 'depth'] = (batch_depth / batch_depth.max()).values
+                continue
             batch_hic = hic[mask, :].copy()
             batch_hic.obs['depth'] = batch_hic.layers['counts'].sum(axis=1)
             batch_hic.obs['depth'] = batch_hic.obs['depth'] / batch_hic.obs['depth'].max()
             hic.obs.loc[mask, 'depth'] = batch_hic.obs['depth'].values
 
-        if binarize:
+        # set hic depth
+        # hic.obs['depth'] = hic.layers['counts'].sum(axis=1)
+        # hic.obs['depth'] = hic.obs['depth'] / hic.obs['depth'].max()
+
+
+        if binarize and not multires:
             hic.X = np.int32(hic.X > 0)
             hic.layers['counts_pre_binarize'] = hic.layers['counts'].copy()
             hic.layers['counts'] = hic.X.copy()
@@ -464,9 +573,17 @@ if __name__ == '__main__':
         scglue.models.configure_dataset(rna, "NB", use_highly_variable=True, use_layer="counts", use_rep="X_pca" if use_rna_pca else None,
                                         use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None,
                                         use_obs_names=True if 'rna' in coassay else False)
-        scglue.models.configure_dataset(hic, "HiCZINB", use_highly_variable=True, use_layer="counts", use_rep=None,
-                                        use_depth="depth" if depth_correction else None, use_batch="batch",
-                                        use_obs_names=True if 'hic' in coassay else False)
+        if multires:
+            scglue.models.configure_dataset(hic, "MultiResHiCZINB", use_highly_variable=False,
+                                            use_layer=None, use_rep=None,
+                                            use_depth="depth" if depth_correction else None, use_batch="batch",
+                                            use_obs_names=True if 'hic' in coassay else False,
+                                            use_multires=True, multires_res_order=resolutions,
+                                            binarize=binarize)
+        else:
+            scglue.models.configure_dataset(hic, "HiCZINB", use_highly_variable=True, use_layer="counts", use_rep=None,
+                                            use_depth="depth" if depth_correction else None, use_batch="batch",
+                                            use_obs_names=True if 'hic' in coassay else False)
         if atac_file is not None:
             scglue.models.configure_dataset(atac, "NB", use_highly_variable=True, use_layer="counts", 
                                         use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None,
@@ -511,17 +628,30 @@ if __name__ == '__main__':
         else:
             dataset_dict = {"rna": rna, "hic": hic}
             modality_weights = {'rna': 1.0, 'hic': hic_weight}
-        glue = scglue.models.fit_SCGLUE(
-            dataset_dict, prior,
-            skip_balance=skip_balance,
-            log_wandb=use_wandb,
-            init_kws={"latent_dim": latent_dim, 
+        init_kws = {"latent_dim": latent_dim,
                     "use_attn": use_attn,
                     "binarize": binarize,
                     "h_dim": h_dim,
                     "h_depth": h_depth,
                     "n_strata": n_strata,
-                    "random_seed": seed},
+                    "random_seed": seed}
+        if multires:
+            init_kws.update({
+                "use_attn": args.multires_use_attn,
+                "multires_use_attn": args.multires_use_attn,
+                "multires_res_dim": args.multires_res_dim,
+                "multires_mlp_max_band": args.multires_mlp_max_band,
+                "multires_conv_channels": tuple(args.multires_conv_channels),
+                "multires_conv_patch": tuple(args.multires_conv_patch),
+                "multires_conv_pool_width": args.multires_conv_pool_width,
+                "multires_anchor_subsample": args.multires_anchor_subsample,
+                "multires_checkpoint": args.multires_checkpoint
+            })
+        glue = scglue.models.fit_SCGLUE(
+            dataset_dict, prior,
+            skip_balance=skip_balance,
+            log_wandb=use_wandb,
+            init_kws=init_kws,
             compile_kws={"lam_align": lam_align, 
                         "lam_graph": lam_graph,
                         "lam_cycle": lam_cycle,
@@ -539,7 +669,8 @@ if __name__ == '__main__':
             model=scglue.models.PairedSCGLUEModel if len(coassay) > 0 else scglue.models.SCGLUEModel
         )
 
-        glue.save(f"{out_dir}/glue_hic_{prior_name}_prior_{resolution}_{n_genes}_{n_strata}.dill")
+        model_name = full_file_suffix if multires else f"{resolution}_{n_genes}_{n_strata}"
+        glue.save(f"{out_dir}/glue_hic_{prior_name}_prior_{model_name}.dill")
         if cache_checkpoint:
             os.makedirs(cache_checkpoint, exist_ok=True)
             n_checkpoints = len(os.listdir(cache_checkpoint))
@@ -547,6 +678,11 @@ if __name__ == '__main__':
         # embed and visualize
         rna.obsm["X_glue"] = glue.encode_data("rna", rna)
         hic.obsm["X_glue"] = glue.encode_data("hic", hic)
+        if multires:
+            # keep the per-resolution parts of the multi-resolution embedding
+            for res_name, res_embedding in glue.encode_data_multires("hic", hic).items():
+                hic.obsm[f"X_glue_{res_name}"] = res_embedding
+                print(f"Per-resolution embedding X_glue_{res_name}: {res_embedding.shape}")
         if atac_file is not None:
             atac.obsm["X_glue"] = glue.encode_data("atac", atac)
             atac.obs['domain'] = 'atac'
@@ -666,7 +802,12 @@ if __name__ == '__main__':
             combined_modalities.append(("atac", atac))
         if methyl_file is not None:
             combined_modalities.append(("methyl", methyl))
-        combined = ad.concat([adata for _, adata in combined_modalities])
+        # only the embeddings and annotations are needed downstream, and reading
+        # `X` of a backed dataset here would defeat the lazy loading
+        combined = ad.concat([
+            ad.AnnData(obs=adata.obs.copy(), obsm={"X_glue": adata.obsm["X_glue"]})
+            for _, adata in combined_modalities
+        ])
 
         sc.pp.neighbors(hic, use_rep="X_glue", metric="cosine", n_neighbors=n_neighbors)
         sc.tl.umap(hic)

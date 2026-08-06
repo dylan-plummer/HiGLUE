@@ -267,9 +267,18 @@ class EmbeddingVisualizer(TrainingPlugin):
             latent_dim=64,
             prefix='pretrain',
             out_dir: str = 'tmp_imgs',
-            save_interval: int = 10
+            save_interval: int = 10,
+            max_decode_elements: float = 5e8
     ) -> None:
         super().__init__()
+        # Decoding every feature of every cell is quadratic in dataset size and
+        # becomes intractable for high resolution / large datasets
+        self.decode_hic = hic.shape[0] * hic.shape[1] <= max_decode_elements
+        if not self.decode_hic:
+            self.logger.info(
+                "Skipping full Hi-C reconstruction visualizations "
+                "(%d cells x %d features)", hic.shape[0], hic.shape[1]
+            )
         self.rna = rna
         self.rna_data_config = rna_data_config
         self.hic = hic
@@ -323,7 +332,10 @@ class EmbeddingVisualizer(TrainingPlugin):
                 # get hic embeddings
                 net.eval()
                 encoder = net.x2u['hic']
-                data = AnnDataset([self.hic], [self.data_config], mode='eval', getitem_size=128)
+                # cap the fetch size so that wide (high resolution) datasets do
+                # not densify a huge minibatch
+                hic_fetch = max(1, min(128, 2 ** 25 // max(self.hic.shape[1], 1)))
+                data = AnnDataset([self.hic], [self.data_config], mode='eval', getitem_size=hic_fetch)
                 data_loader = DataLoader(
                     data, batch_size=1, shuffle=False,
                     num_workers=config.DATALOADER_NUM_WORKERS,
@@ -443,18 +455,19 @@ class EmbeddingVisualizer(TrainingPlugin):
                     pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY, drop_last=False,
                     persistent_workers=False
                 )
-                hic_pred_rna = []
-                hic_pred_hic = []
-                for u_, b_, l_ in data_loader:
-                    u_ = u_.to(net.device, non_blocking=True)
-                    b_ = b_.to(net.device, non_blocking=True)
-                    l_ = l_.to(net.device, non_blocking=True)
-                    hic_pred_rna.append(net.u2x['rna'](u_, v_rna, b_, l_).mean.detach().cpu())
-                    hic_pred_hic.append(net.u2x['hic'](u_, v_hic, b_, l_).mean.detach().cpu())
-                hic_pred_rna = torch.cat(hic_pred_rna).numpy()
-                self.hic.obsm['X_pred_rna'] = hic_pred_rna
-                hic_pred_hic = torch.cat(hic_pred_hic).numpy()
-                self.hic.obsm['X_pred_hic'] = hic_pred_hic
+                if self.decode_hic:
+                    hic_pred_rna = []
+                    hic_pred_hic = []
+                    for u_, b_, l_ in data_loader:
+                        u_ = u_.to(net.device, non_blocking=True)
+                        b_ = b_.to(net.device, non_blocking=True)
+                        l_ = l_.to(net.device, non_blocking=True)
+                        hic_pred_rna.append(net.u2x['rna'](u_, v_rna, b_, l_).mean.detach().cpu())
+                        hic_pred_hic.append(net.u2x['hic'](u_, v_hic, b_, l_).mean.detach().cpu())
+                    hic_pred_rna = torch.cat(hic_pred_rna).numpy()
+                    self.hic.obsm['X_pred_rna'] = hic_pred_rna
+                    hic_pred_hic = torch.cat(hic_pred_hic).numpy()
+                    self.hic.obsm['X_pred_hic'] = hic_pred_hic
 
                 data = ArrayDataset(self.rna.obsm['X_glue'], b_rna, l_rna, getitem_size=128)
                 data_loader = DataLoader(
@@ -463,7 +476,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                     pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY, drop_last=False,
                     persistent_workers=False
                 )
-                if self.rna.shape[0] < 20000:
+                if self.decode_hic and self.rna.shape[0] < 20000:
                     rna_pred_rna = []
                     rna_pred_hic = []
                     for u_, b_, l_ in data_loader:
@@ -867,6 +880,11 @@ class EmbeddingVisualizer(TrainingPlugin):
                 self.hic.obsm['X_pca'] = x_pca
 
                 # cluster embeddings
+                for adata in (self.hic, self.atac, self.methyl):
+                    # a neighbor graph is only carried over from preprocessing
+                    # for datasets small enough to embed there
+                    if adata is not None and "neighbors" not in adata.uns:
+                        sc.pp.neighbors(adata, use_rep="X_glue", metric="cosine")
                 sc.tl.leiden(self.hic)
                 #self.hic.obs['kmeans'] = KMeans(n_clusters=len(self.hic.obs['celltype'].unique())).fit_predict(self.hic.obsm['X_glue'])
                 self.hic.obs['agglomerative'] = AgglomerativeClustering(n_clusters=len(self.hic.obs['celltype'].unique())).fit_predict(self.hic.obsm['X_glue'])

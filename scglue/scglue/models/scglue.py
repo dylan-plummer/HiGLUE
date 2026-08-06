@@ -3,6 +3,7 @@ Graph-linked unified embedding (GLUE) for single-cell multi-omics
 data integration
 """
 
+import contextlib
 import copy
 import os
 from itertools import chain
@@ -57,6 +58,78 @@ register_prob_model("ZILN", sc.VanillaDataEncoder, sc.ZILNDataDecoder)
 register_prob_model("NB", sc.NBDataEncoder, sc.NBDataDecoder)
 register_prob_model("ZINB", sc.NBDataEncoder, sc.ZINBDataDecoder)
 register_prob_model("HiCZINB", sc.HiCDataEncoder, sc.StratifiedZINBDataDecoder)  # same encoder but strata-specific decoder
+register_prob_model("MultiResHiCZINB", sc.MultiResHiCDataEncoder, sc.MultiResStratifiedZINBDataDecoder)
+
+HIC_PROB_MODELS = ("HiCNB", "HiCZINB")
+MULTIRES_PROB_MODELS = ("MultiResHiCZINB", )
+
+
+def build_res_specs(
+        data_config: Mapping, mlp_max_band: int = 262144
+) -> Tuple[List[sc.ResolutionSpec], List[str]]:
+    r"""
+    Build per-resolution specifications from a multi-resolution data config
+
+    Parameters
+    ----------
+    data_config
+        Data configuration of a multi-resolution Hi-C modality
+        (see :func:`scglue.models.configure_dataset`)
+    mlp_max_band
+        Bands with at most this many entries are embedded with a dense
+        projection, larger ones use a convolutional trunk
+
+    Returns
+    -------
+    res_specs
+        Per-resolution specifications
+    anchor_names
+        Anchor (graph vertex) names of all resolutions, concatenated in the
+        same order as ``res_specs``
+    """
+    if "multires" not in data_config:
+        raise ValueError(
+            "Multi-resolution data must be configured with "
+            "`configure_dataset(..., use_multires=True)`!"
+        )
+    multires = data_config["multires"]
+    res_order = [str(item) for item in multires["res_order"]]
+    n_strata = [int(item) for item in multires["n_strata"]]
+    feature_res_code = np.asarray(multires["feature_res_code"], dtype=np.int64)
+    feature_stratum = np.asarray(multires["feature_stratum"], dtype=np.int64)
+    feature_anchor_pos = np.asarray(multires["feature_anchor_pos"], dtype=np.int64)
+    n_features = len(data_config["features"])
+    if not feature_res_code.size == feature_stratum.size == \
+            feature_anchor_pos.size == n_features:
+        raise ValueError(
+            "Multi-resolution feature annotations do not match the "
+            "configured features!"
+        )
+
+    res_specs, anchor_names, offset = [], [], 0
+    for i, res in enumerate(res_order):
+        res_anchors = [str(item) for item in multires["anchors"][res]]
+        n_anchors, strata = len(res_anchors), n_strata[i]
+        mask = feature_res_code == i
+        feat_idx = np.where(mask)[0]
+        if not feat_idx.size:
+            raise ValueError(f"Resolution '{res}' has no features!")
+        strata_of_feat = feature_stratum[mask]
+        anchor_of_feat = feature_anchor_pos[mask]
+        if strata_of_feat.max() >= strata or anchor_of_feat.max() >= n_anchors:
+            raise ValueError(
+                f"Resolution '{res}' has features outside of its "
+                f"{strata} strata x {n_anchors} anchors band!"
+            )
+        band_idx = np.full(strata * n_anchors, -1, dtype=np.int64)
+        band_idx[strata_of_feat * n_anchors + anchor_of_feat] = feat_idx
+        res_specs.append(sc.ResolutionSpec(
+            res, strata, n_anchors, offset, band_idx, feat_idx,
+            use_conv=strata * n_anchors > mlp_max_band
+        ))
+        anchor_names += res_anchors
+        offset += n_anchors
+    return res_specs, anchor_names
 
 
 #----------------------------- Network definition ------------------------------
@@ -234,6 +307,53 @@ class SCGLUETrainer(GLUETrainer):
         for item in chain(self.net.x2u.parameters(), self.net.du.parameters()):
             item.requires_grad_(not self._freeze_u)
 
+    def feature_subsets(self) -> Mapping[str, Optional[sc.FeatureSubset]]:
+        r"""
+        Sample a feature subset for every modality whose decoder supports it
+
+        Decoders of high-resolution modalities can restrict the reconstruction
+        loss to a random subset of features, which keeps the memory footprint
+        of the reconstruction tractable when a modality has millions of
+        features. Modalities without such support return ``None``.
+        """
+        subsets = {}
+        for k in self.net.keys:
+            sampler = getattr(self.net.u2x[k], "sample_feature_subset", None)
+            subsets[k] = sampler() if sampler is not None else None
+        return subsets
+
+    @staticmethod
+    def recon_targets(
+            x: Mapping[str, torch.Tensor], l: Mapping[str, torch.Tensor],
+            subsets: Mapping[str, Optional[sc.FeatureSubset]],
+            net: SCGLUE
+    ) -> Tuple[Mapping[str, torch.Tensor], Mapping[str, torch.Tensor]]:
+        r"""
+        Restrict reconstruction targets and normalizers to the sampled subsets
+        """
+        x_target, l_target = {}, {}
+        for k in net.keys:
+            subset = subsets[k]
+            if subset is None:
+                x_target[k], l_target[k] = x[k], l[k]
+            else:
+                x_target[k] = subset.index_data(x[k])
+                l_target[k] = subset.library_size(x_target[k], net.u2x[k].n_res)
+        return x_target, l_target
+
+    @staticmethod
+    def decode(
+            decoder: torch.nn.Module, u: torch.Tensor, v: torch.Tensor,
+            b: torch.Tensor, l: Optional[torch.Tensor],
+            subset: Optional[sc.FeatureSubset] = None
+    ) -> D.Distribution:
+        r"""
+        Decode data, optionally restricted to a feature subset
+        """
+        if subset is None:
+            return decoder(u, v, b, l)
+        return decoder(u, v, b, l, subset=subset)
+
     def format_data(self, data: List[torch.Tensor]) -> DataTensors:
         r"""
         Format data tensors
@@ -305,8 +425,12 @@ class SCGLUETrainer(GLUETrainer):
             x, xrep, xbch, xlbl, xdwt, xrds, xflag, eidx, ewt, esgn = data
 
         u, l = {}, {}
-        for k in net.keys:
-            u[k], l[k] = net.x2u[k](x[k], xrep[k], lazy_normalizer=dsc_only)
+        # The discriminator step only updates `du`/`durds`, so encoder
+        # activations do not have to be kept for the backward pass. Skipping
+        # them makes room for modalities with millions of features.
+        with torch.no_grad() if dsc_only else contextlib.nullcontext():
+            for k in net.keys:
+                u[k], l[k] = net.x2u[k](x[k], xrep[k], lazy_normalizer=dsc_only)
         usamp = {k: u[k].rsample() for k in net.keys}
         if self.normalize_u:
             usamp = {k: F.normalize(usamp[k], dim=1) for k in net.keys}
@@ -358,16 +482,19 @@ class SCGLUETrainer(GLUETrainer):
         g_kl = D.kl_divergence(v, prior).sum(dim=1).mean() / vsamp.shape[0]
         g_elbo = g_nll + self.lam_kl * g_kl
 
+        subsets = self.feature_subsets()
+        x_target, l_target = self.recon_targets(x, l, subsets, net)
         x_nll = {
-            k: -net.u2x[k](
-                usamp[k], vsamp[getattr(net, f"{k}_idx")], xbch[k], l[k]
-            ).log_prob(x[k]).mean()
+            k: -self.decode(
+                net.u2x[k], usamp[k], vsamp[getattr(net, f"{k}_idx")],
+                xbch[k], l_target[k], subsets[k]
+            ).log_prob(x_target[k]).mean()
             for k in net.keys
         }
         x_kl = {
             k: D.kl_divergence(
                 u[k], prior
-            ).sum(dim=1).mean() / x[k].shape[1]
+            ).sum(dim=1).mean() / x_target[k].shape[1]
             for k in net.keys
         }
         x_elbo = {
@@ -379,7 +506,7 @@ class SCGLUETrainer(GLUETrainer):
         vae_loss = self.lam_data * x_elbo_sum \
             + self.lam_graph * len(net.keys) * g_elbo \
             + self.lam_sup * sup_loss
-        
+
         # cycle_loss = torch.tensor(0.0, device=self.net.device)
         # for source_key in net.keys:
         #     for target_key in net.keys:
@@ -596,8 +723,12 @@ class PairedSCGLUETrainer(SCGLUETrainer):
         x, xrep, xbch, xlbl, xdwt, xrds, xflag, pmsk, eidx, ewt, esgn = data
 
         u, l = {}, {}
-        for k in net.keys:
-            u[k], l[k] = net.x2u[k](x[k], xrep[k], lazy_normalizer=dsc_only)
+        # The discriminator step only updates `du`/`durds`, so encoder
+        # activations do not have to be kept for the backward pass. Skipping
+        # them makes room for modalities with millions of features.
+        with torch.no_grad() if dsc_only else contextlib.nullcontext():
+            for k in net.keys:
+                u[k], l[k] = net.x2u[k](x[k], xrep[k], lazy_normalizer=dsc_only)
         usamp = {k: u[k].rsample() for k in net.keys}
         if self.normalize_u:
             usamp = {k: F.normalize(usamp[k], dim=1) for k in net.keys}
@@ -644,16 +775,19 @@ class PairedSCGLUETrainer(SCGLUETrainer):
         g_nll = (g_nll_pn[0] / max(n_neg, 1) + g_nll_pn[1] / max(n_pos, 1)) / avgc
         g_kl = D.kl_divergence(v, prior).sum(dim=1).mean() / vsamp.shape[0]
         g_elbo = g_nll + self.lam_kl * g_kl
+        subsets = self.feature_subsets()
+        x_target, l_target = self.recon_targets(x, l, subsets, net)
         x_nll = {
-            k: -net.u2x[k](
-                usamp[k], vsamp[getattr(net, f"{k}_idx")], xbch[k], l[k]
-            ).log_prob(x[k]).mean()
+            k: -self.decode(
+                net.u2x[k], usamp[k], vsamp[getattr(net, f"{k}_idx")],
+                xbch[k], l_target[k], subsets[k]
+            ).log_prob(x_target[k]).mean()
             for k in net.keys
         }
         x_kl = {
             k: D.kl_divergence(
                 u[k], prior
-            ).sum(dim=1).mean() / x[k].shape[1]
+            ).sum(dim=1).mean() / x_target[k].shape[1]
             for k in net.keys
         }
         x_elbo = {
@@ -671,10 +805,11 @@ class PairedSCGLUETrainer(SCGLUETrainer):
 
         if self.lam_joint_cross:
             x_joint_cross_nll = {
-                k: -net.u2x[k](
-                    usamp_mean[m], vsamp[getattr(net, f"{k}_idx")],
-                    xbch[k][m], None if l[k] is None else l[k][m]
-                ).log_prob(x[k][m]).mean()
+                k: -self.decode(
+                    net.u2x[k], usamp_mean[m], vsamp[getattr(net, f"{k}_idx")],
+                    xbch[k][m], None if l_target[k] is None else l_target[k][m],
+                    subsets[k]
+                ).log_prob(x_target[k][m]).mean()
                 for k, m in zip(net.keys, pmsk) if m.sum()
             }
             joint_cross_loss = sum(
@@ -693,10 +828,13 @@ class PairedSCGLUETrainer(SCGLUETrainer):
                         continue
                     m = m_src & m_tgt
                     if m.sum():
-                        x_tgt_real_cross_nll += -net.u2x[k_tgt](
-                            usamp[k_src][m], vsamp[getattr(net, f"{k_tgt}_idx")],
-                            xbch[k_tgt][m], None if l[k_tgt] is None else l[k_tgt][m]
-                        ).log_prob(x[k_tgt][m]).mean()
+                        x_tgt_real_cross_nll += -self.decode(
+                            net.u2x[k_tgt], usamp[k_src][m],
+                            vsamp[getattr(net, f"{k_tgt}_idx")],
+                            xbch[k_tgt][m],
+                            None if l_target[k_tgt] is None else l_target[k_tgt][m],
+                            subsets[k_tgt]
+                        ).log_prob(x_target[k_tgt][m]).mean()
                 x_real_cross_nll[k_tgt] = x_tgt_real_cross_nll
             real_cross_loss = sum(
                 self.modality_weight[k] * nll
@@ -791,6 +929,14 @@ class SCGLUEModel(Model):
             use_attn: bool = False,
             binarize: bool = False,
             n_strata: int = 5,
+            multires_res_dim: Optional[int] = None,
+            multires_mlp_max_band: int = 262144,
+            multires_conv_channels: Tuple[int, int, int] = (8, 16, 32),
+            multires_conv_patch: Tuple[int, int] = (2, 8),
+            multires_conv_pool_width: int = 32,
+            multires_anchor_subsample: Optional[int] = None,
+            multires_use_attn: bool = False,
+            multires_checkpoint: bool = False,
             random_seed: int = 0
     ) -> None:
         self.vertices = pd.Index(vertices)
@@ -818,7 +964,25 @@ class SCGLUEModel(Model):
                     "It is recommended that `use_rep` dimensionality "
                     "be equal or larger than `latent_dim`."
                 )
-            if data_config["prob_model"] in ['HiCNB', 'HiCZINB']:
+            res_specs = None
+            if data_config["prob_model"] in MULTIRES_PROB_MODELS:
+                res_specs, anchor_names = build_res_specs(
+                    data_config, mlp_max_band=multires_mlp_max_band
+                )
+                self.logger.info(
+                    "Multi-resolution Hi-C modality '%s': %s",
+                    k, ", ".join(repr(spec) for spec in res_specs)
+                )
+                idx[k] = self.vertices.get_indexer(anchor_names).astype(np.int64)
+                if idx[k].min() < 0:
+                    missing = [
+                        name for name, i in zip(anchor_names, idx[k]) if i < 0
+                    ]
+                    raise ValueError(
+                        f"{len(missing)} Hi-C anchors are missing from the graph "
+                        f"(e.g. {missing[:5]})!"
+                    )
+            elif data_config["prob_model"] in HIC_PROB_MODELS:
                 feats = []
                 for feat in data_config["features"]:
                     if feat[-2] != '-':  # non-distal feat
@@ -826,7 +990,7 @@ class SCGLUEModel(Model):
                 idx[k] = self.vertices.get_indexer(feats).astype(np.int64)
             else:
                 idx[k] = self.vertices.get_indexer(data_config["features"]).astype(np.int64)
-            if idx[k].min() < 0 and data_config["prob_model"] not in ['HiCNB', 'HiCZINB']:  # 2D Hi-C inputs only contain one node per strata
+            if idx[k].min() < 0 and data_config["prob_model"] not in HIC_PROB_MODELS:  # 2D Hi-C inputs only contain one node per strata
                 # print(idx[k])
                 # print(k)
                 # print(data_config["features"][-1])
@@ -840,7 +1004,33 @@ class SCGLUEModel(Model):
             
             data_config["batches"] = pd.Index([]) if data_config["batches"] is None \
                 else pd.Index(data_config["batches"])
-            if data_config["prob_model"] in ['HiCNB', 'HiCZINB']:
+            if res_specs is not None:
+                if data_config["rep_dim"]:
+                    raise ValueError(
+                        "`use_rep` is not supported for multi-resolution Hi-C data!"
+                    )
+                x2u[k] = _ENCODER_MAP[data_config["prob_model"]](
+                    len(data_config["features"]), latent_dim,
+                    h_depth=h_depth, h_dim=h_dim, dropout=dropout,
+                    res_specs=res_specs,
+                    res_dim=multires_res_dim or h_dim,
+                    conv_channels=multires_conv_channels,
+                    conv_patch=multires_conv_patch,
+                    conv_pool_width=multires_conv_pool_width,
+                    checkpoint=multires_checkpoint
+                )
+                u2x[k] = _DECODER_MAP[data_config["prob_model"]](
+                    len(data_config["features"]),
+                    n_batches=max(data_config["batches"].size, 1),
+                    embedding_size=latent_dim,
+                    res_specs=res_specs,
+                    shifted_additive=shifted_additive,
+                    use_activation=use_activation,
+                    use_attn=multires_use_attn,
+                    binarize=binarize,
+                    anchor_subsample=multires_anchor_subsample
+                )
+            elif data_config["prob_model"] in HIC_PROB_MODELS:
                 strata_masks = []
                 strata_idxs = []
                 feature_masks = []
@@ -1244,6 +1434,38 @@ class SCGLUEModel(Model):
             ]).permute(1, 0, 2).numpy()
         return v.mean.detach().cpu().numpy()
 
+    MAX_FETCH_ELEMENTS: int = 2 ** 25  # Cap on minibatch elements when encoding
+
+    def safe_batch_size(self, key: str, batch_size: int) -> int:
+        r"""
+        Shrink an encoding minibatch so that it stays within
+        :attr:`MAX_FETCH_ELEMENTS` elements
+
+        Modalities with millions of features (e.g. high resolution Hi-C) would
+        otherwise densify minibatches larger than the available memory. The
+        result of encoding is unaffected, since cells are encoded independently.
+
+        Parameters
+        ----------
+        key
+            Modality key
+        batch_size
+            Requested minibatch size
+
+        Returns
+        -------
+        batch_size
+            Minibatch size to use
+        """
+        n_features = max(len(self.modalities[key]["features"]), 1)
+        capped = max(1, min(batch_size, self.MAX_FETCH_ELEMENTS // n_features))
+        if capped < batch_size:
+            self.logger.debug(
+                "Reducing encoding batch size for '%s' from %d to %d "
+                "(%d features)", key, batch_size, capped, n_features
+            )
+        return capped
+
     @torch.no_grad()
     def encode_data(
             self, key: str, adata: AnnData, batch_size: int = 128,
@@ -1277,7 +1499,7 @@ class SCGLUEModel(Model):
         encoder = self.net.x2u[key]
         data = AnnDataset(
             [adata], [self.modalities[key]],
-            mode="eval", getitem_size=batch_size
+            mode="eval", getitem_size=self.safe_batch_size(key, batch_size)
         )
         data_loader = DataLoader(
             data, batch_size=1, shuffle=False,
@@ -1297,6 +1519,58 @@ class SCGLUEModel(Model):
             else:
                 result.append(u.mean.detach().cpu())
         return torch.cat(result).numpy()
+
+    @torch.no_grad()
+    def encode_data_multires(
+            self, key: str, adata: AnnData, batch_size: int = 128
+    ) -> Mapping[str, np.ndarray]:
+        r"""
+        Compute per-resolution cell embeddings of a multi-resolution modality
+
+        Parameters
+        ----------
+        key
+            Modality key
+        adata
+            Input dataset
+        batch_size
+            Size of minibatches
+
+        Returns
+        -------
+        embeddings
+            Per-resolution cell embeddings (indexed by resolution name)
+
+        Note
+        ----
+        The concatenation of these embeddings is what the encoder fuses into
+        the shared latent space, so they can be used to inspect how much each
+        resolution contributes to the joint embedding.
+        """
+        encoder = self.net.x2u[key]
+        if not isinstance(encoder, sc.MultiResHiCDataEncoder):
+            raise ValueError(f"Modality '{key}' is not multi-resolution!")
+        self.net.eval()
+        data = AnnDataset(
+            [adata], [self.modalities[key]],
+            mode="eval", getitem_size=self.safe_batch_size(key, batch_size)
+        )
+        data_loader = DataLoader(
+            data, batch_size=1, shuffle=False,
+            num_workers=config.DATALOADER_NUM_WORKERS,
+            pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY,
+            drop_last=False, persistent_workers=False
+        )
+        result = {name: [] for name in encoder.res_names}
+        for x, *_ in data_loader:
+            x = x.to(self.net.device, non_blocking=True)
+            parts = encoder.encode_resolutions(x, encoder.compute_l(x))
+            for name, part in zip(encoder.res_names, parts):
+                result[name].append(part.detach().cpu())
+        return {
+            name: torch.cat(parts).numpy()
+            for name, parts in result.items()
+        }
 
     @torch.no_grad()
     def decode_data(

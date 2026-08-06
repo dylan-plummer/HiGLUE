@@ -18,6 +18,7 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import scipy.sparse
+import scipy.stats
 import torch
 from anndata import AnnData
 from anndata._core.sparse_dataset import SparseDataset
@@ -28,6 +29,94 @@ from ..utils import config, get_rs, logged, processes
 from .nn import get_default_numpy_dtype
 
 DATA_CONFIG = Mapping[str, Any]
+
+
+#------------------------------- Backed matrices -------------------------------
+
+@logged
+class BackedMatrix:
+
+    r"""
+    Row-lazy view of a matrix stored in a backed (on-disk) :class:`AnnData`
+    object, with optional column subsetting and binarization.
+
+    Only the requested rows are read from disk and densified, which makes it
+    possible to train on datasets whose dense representation would not fit in
+    memory (e.g. high resolution Hi-C).
+
+    Parameters
+    ----------
+    arr
+        Backed matrix (:class:`h5py.Dataset` or
+        :class:`anndata._core.sparse_dataset.SparseDataset`)
+    row_idx
+        Rows to keep, by default all rows
+    col_idx
+        Columns to keep, by default all columns
+    dtype
+        Dtype of the fetched minibatches
+    binarize
+        Whether to binarize the fetched minibatches
+    """
+
+    def __init__(
+            self, arr: Any, row_idx: Optional[np.ndarray] = None,
+            col_idx: Optional[np.ndarray] = None,
+            dtype: type = None, binarize: bool = False
+    ) -> None:
+        self.dtype = np.dtype(dtype or get_default_numpy_dtype())
+        self.binarize = binarize
+        self.row_idx = None if row_idx is None else np.asarray(row_idx, dtype=np.int64)
+        self.col_idx = None if col_idx is None else np.asarray(col_idx, dtype=np.int64)
+        self._sparse = isinstance(arr, SparseDataset)
+        self._filename, self._path = self._locate(arr)
+        self._pid = os.getpid()
+        self._arr = arr
+        n_obs, n_var = arr.shape
+        self.shape = (
+            n_obs if self.row_idx is None else self.row_idx.size,
+            n_var if self.col_idx is None else self.col_idx.size
+        )
+
+    @staticmethod
+    def _locate(arr: Any) -> Tuple[str, str]:
+        group = getattr(arr, "group", arr)
+        return group.file.filename, group.name
+
+    def _ensure_open(self) -> Any:
+        if self._arr is None or self._pid != os.getpid():
+            handle = h5py.File(self._filename, "r")
+            group = handle[self._path]
+            self._arr = SparseDataset(group) if self._sparse else group
+            self._pid = os.getpid()
+        return self._arr
+
+    def __getstate__(self) -> Mapping[str, Any]:
+        state = self.__dict__.copy()
+        state["_arr"] = None  # h5py objects cannot be pickled
+        return state
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __getitem__(self, idx: np.ndarray) -> np.ndarray:
+        arr = self._ensure_open()
+        idx = np.asarray(idx)
+        if self.row_idx is not None:
+            idx = self.row_idx[idx]
+        # Convert to sequential (and unique) access and back, as required by h5py
+        rank = scipy.stats.rankdata(idx, method="dense") - 1
+        sorted_idx = np.empty(rank.max() + 1, dtype=int)
+        sorted_idx[rank] = idx
+        sub = arr[sorted_idx.tolist()]
+        if self.col_idx is not None:
+            sub = sub[:, self.col_idx]
+        if scipy.sparse.issparse(sub):
+            sub = sub.toarray()
+        sub = sub[rank.tolist()]
+        if self.binarize:
+            sub = sub > 0
+        return np.ascontiguousarray(sub, dtype=self.dtype)
 
 
 #---------------------------------- Datasets -----------------------------------
@@ -482,23 +571,46 @@ class AnnDataset(Dataset):
         default_dtype = get_default_numpy_dtype()
         features = data_config["features"]
         use_layer = data_config["use_layer"]
-        if not np.array_equal(adata.var_names, features):
-            adata = adata[:, features]  # This will load all data to memory if backed
+        binarize = bool(data_config.get("binarize", False))
+        source, row_idx = adata, None
+        if adata.isbacked and adata.is_view:
+            # Reading `.X` of a backed view materializes the selected rows, so
+            # keep referring to the backed parent and remember the row subset
+            ref = getattr(adata, "_adata_ref", None)
+            oidx = getattr(adata, "_oidx", None)
+            if ref is not None and oidx is not None and ref.isbacked:
+                source = ref
+                row_idx = np.arange(ref.shape[0])[oidx]
+        col_idx = None
+        if not np.array_equal(source.var_names, features):
+            if source.isbacked:  # Subsetting a backed object would load everything
+                col_idx = source.var_names.get_indexer(features)
+                if col_idx.min() < 0:
+                    raise ValueError(
+                        "Configured features cannot be found in input data!"
+                    )
+            else:
+                source = source[:, features]  # This will load all data to memory if backed
         if use_layer:
-            if use_layer not in adata.layers:
+            if use_layer not in source.layers:
                 raise ValueError(
                     f"Configured data layer '{use_layer}' "
                     f"cannot be found in input data!"
                 )
-            x = adata.layers[use_layer]
+            x = source.layers[use_layer]
         else:
-            x = adata.X
+            x = source.X
+        if isinstance(x, (h5py.Dataset, SparseDataset)):
+            # Read lazily, one minibatch at a time
+            return BackedMatrix(
+                x, row_idx=row_idx, col_idx=col_idx,
+                dtype=default_dtype, binarize=binarize
+            )
+        if col_idx is not None:
+            x = x[:, col_idx]
+        if binarize:
+            x = x > 0
         if x.dtype.type is not default_dtype:
-            if isinstance(x, (h5py.Dataset, SparseDataset)):
-                raise RuntimeError(
-                    f"User is responsible for ensuring a {default_dtype} dtype "
-                    f"when using backed data!"
-                )
             x = x.astype(default_dtype)
         if scipy.sparse.issparse(x):
             x = x.tocsr()

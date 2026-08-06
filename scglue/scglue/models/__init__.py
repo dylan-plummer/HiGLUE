@@ -25,6 +25,87 @@ from .plugins import EmbeddingVisualizer
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+def build_multires_config(
+        adata: AnnData, features: list,
+        res_key: str = "res", stratum_key: str = "stratum",
+        anchor_key: str = "anchor",
+        res_order: Optional[list] = None
+) -> Mapping:
+    r"""
+    Summarize the multi-resolution layout of a Hi-C modality
+
+    Parameters
+    ----------
+    adata
+        Multi-resolution Hi-C dataset. ``adata.var`` must contain the
+        resolution, stratum and anchor of every feature.
+    features
+        Features used by the model, in order
+    res_key
+        ``adata.var`` column holding the resolution of each feature
+    stratum_key
+        ``adata.var`` column holding the diagonal stratum of each feature
+    anchor_key
+        ``adata.var`` column holding the name of the anchor (i.e. the
+        stratum 0 feature) each feature belongs to
+    res_order
+        Resolution order (coarse to fine), by default the order of first
+        appearance in ``adata.var``
+
+    Returns
+    -------
+    multires
+        Multi-resolution configuration
+    """
+    for key in (res_key, stratum_key, anchor_key):
+        if key not in adata.var:
+            raise ValueError(
+                f"Multi-resolution data requires a '{key}' column in `adata.var`!"
+            )
+    var = adata.var.loc[features, [res_key, stratum_key, anchor_key]]
+    feature_res = var[res_key].astype(str).to_numpy()
+    feature_stratum = var[stratum_key].to_numpy().astype(np.int64)
+    feature_anchor = var[anchor_key].astype(str).to_numpy()
+    if res_order is None:
+        res_order = list(pd.unique(feature_res))
+    else:
+        res_order = [str(item) for item in res_order]
+        missing = set(feature_res).difference(res_order)
+        if missing:
+            raise ValueError(f"Resolutions {sorted(missing)} missing from `res_order`!")
+
+    feature_res_code = np.full(len(features), -1, dtype=np.int64)
+    feature_anchor_pos = np.zeros(len(features), dtype=np.int64)
+    anchors, n_strata = {}, []
+    features_index = pd.Index(features)
+    for i, res in enumerate(res_order):
+        mask = feature_res == res
+        if not mask.any():
+            raise ValueError(f"Resolution '{res}' has no features!")
+        feature_res_code[mask] = i
+        res_anchors = features_index[mask & (feature_stratum == 0)]
+        if not res_anchors.size:
+            raise ValueError(f"Resolution '{res}' has no stratum 0 features!")
+        pos = res_anchors.get_indexer(feature_anchor[mask])
+        if pos.min() < 0:
+            orphan = feature_anchor[mask][pos < 0]
+            raise ValueError(
+                f"Resolution '{res}' has {orphan.size} features whose anchor is "
+                f"not itself a feature (e.g. {orphan[:5].tolist()})!"
+            )
+        feature_anchor_pos[mask] = pos
+        anchors[res] = res_anchors.to_numpy().tolist()
+        n_strata.append(int(feature_stratum[mask].max()) + 1)
+    return {
+        "res_order": res_order,
+        "n_strata": n_strata,
+        "anchors": anchors,
+        "feature_res_code": feature_res_code,
+        "feature_stratum": feature_stratum,
+        "feature_anchor_pos": feature_anchor_pos
+    }
+
+
 @logged
 def configure_dataset(
         adata: AnnData, prob_model: str,
@@ -35,7 +116,10 @@ def configure_dataset(
         use_depth: Optional[str] = None,
         use_cell_type: Optional[str] = None,
         use_dsc_weight: Optional[str] = None,
-        use_obs_names: bool = False
+        use_obs_names: bool = False,
+        use_multires: bool = False,
+        multires_res_order: Optional[list] = None,
+        binarize: bool = False
 ) -> None:
     r"""
     Configure dataset for model training
@@ -63,6 +147,15 @@ def configure_dataset(
     use_obs_names
         Whether to use ``obs_names`` to mark paired cells across
         different datasets
+    use_multires
+        Whether the dataset holds features at multiple resolutions
+        (requires ``res``, ``stratum`` and ``anchor`` columns in ``adata.var``)
+    multires_res_order
+        Resolution order (coarse to fine), only used with ``use_multires``
+    binarize
+        Whether to binarize the data when fetching minibatches. This is applied
+        on the fly, which keeps the original counts on disk untouched and works
+        with backed datasets.
 
     Note
     -----
@@ -132,6 +225,11 @@ def configure_dataset(
     else:
         data_config["use_dsc_weight"] = None
     data_config["use_obs_names"] = use_obs_names
+    data_config["binarize"] = binarize
+    if use_multires:
+        data_config["multires"] = build_multires_config(
+            adata, data_config["features"], res_order=multires_res_order
+        )
     adata.uns[config.ANNDATA_KEY] = data_config
 
 

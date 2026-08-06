@@ -34,3 +34,84 @@ python higlue.py \
 `--preprocess` will generate all of the preprocessed data files in `data/<dset>_data/` and `--train` will train the HiGLUE model. You can provide both flags to run preprocessing and training in one command or run them separately.
 
 Arguments provided after `SCORE` are for loading and preprocessing the scHi-C data with `SCORE` and are passed directly to `SCORE`.
+
+## Multi-resolution training
+
+Passing `--resolutions` trains a **single** model on Hi-C features built at several
+resolutions at once. Every cell is then represented by a multi-resolution
+embedding: each resolution is encoded separately (with convolutions over its band
+matrix when it is too large for a dense projection) and the per-resolution
+embeddings are fused into the shared latent space that is aligned with RNA.
+
+```
+python higlue.py \
+	--rna_file hires_brain_rna.h5ad \
+	--gtf gencode.vM25.annotation.gtf \
+	--resolutions 500kb 100kb 5kb \
+	--multires_strata 10 20 40 \
+	--multires_max_anchors 0 0 20000 \
+	--multires_anchor_subsample 4000 \
+	--backed \
+	--preprocess \
+	--train \
+	SCORE \
+	--dset hires_brain \
+	--scool hires_brain_5kb.scool \
+	--reference hires_brain_ref \
+	--resolution 5kb \
+	--min_depth 100000;
+```
+
+Only one `.scool` file is needed: pass the **finest** resolution to `SCORE`
+(`--scool` / `--resolution`) and the coarser grids are derived from it by
+re-binning genomic coordinates. Resolutions are always ordered coarse to fine,
+and per-resolution options accept either a single value or one value per
+resolution:
+
+| Option | Meaning |
+| --- | --- |
+| `--resolutions` | resolutions to model jointly (e.g. `500kb 100kb 5kb`) |
+| `--multires_strata` | diagonal strata kept per resolution (band height); defaults to `--n_strata` |
+| `--multires_max_anchors` | anchor budget per resolution (`0` = keep every detected anchor); defaults to `50000` |
+| `--multires_tile_size` | anchors are kept in contiguous tiles of this many bins |
+| `--multires_stat_cells` | cells scanned to rank anchors and contacts (default: all) |
+| `--multires_min_frac` | minimum fraction of cells in which an anchor must be detected |
+| `--multires_mlp_max_band` | bands larger than this are encoded with convolutions instead of a dense projection |
+| `--multires_res_dim` | size of each per-resolution embedding (default `--h_dim`) |
+| `--multires_anchor_subsample` | anchors per resolution reconstructed in each training step |
+| `--multires_checkpoint` | recompute the per-resolution encoders in the backward pass (less GPU memory, more compute) |
+| `--backed` | read the Hi-C matrix from disk one minibatch at a time |
+
+After training, the fused embedding is stored in `hic.obsm["X_glue"]` and the
+per-resolution parts in `hic.obsm["X_glue_<resolution>"]`.
+
+### Large and high resolution datasets
+
+High resolution representations are built without ever materializing a dense
+`cells x features` matrix:
+
+* cells are streamed from the `.scool` file one at a time, both when collecting
+  the statistics used for feature selection and when writing the output, so
+  preprocessing memory depends on the size of the genome rather than on the
+  number of cells;
+* the feature space of each resolution is filtered down to its anchor budget
+  *before* any per-cell data is written. Anchors are ranked by how variable
+  their local contact coverage is across cells, with bins overlapping promoters
+  of highly variable genes prioritized, and are kept in contiguous tiles so that
+  the band matrix stays spatially coherent;
+* the Hi-C dataset is written as a sparse `.h5ad`, and `--backed` keeps it on
+  disk during training, densifying only the current minibatch;
+* `--multires_anchor_subsample` restricts each training step's reconstruction to
+  a random subset of anchors per resolution, which is what keeps the decoder
+  tractable when a dataset has millions of features.
+
+The guidance graph is also multi-scale: in addition to promoter/anchor overlaps
+and the top pseudobulk contacts of each resolution, every fine anchor is linked
+to the coarse bin containing it, so high resolution features remain connected to
+genes even where no contact passes the loop cutoff.
+
+Rough sizing from a HiRes mouse brain dataset (398 cells, `500kb`/`100kb`/`5kb`
+with 10/20/40 strata, `20000` 5kb anchors, 1.33M Hi-C features): preprocessing
+peaked at 5.8 GB of RAM and produced a 560 MB sparse `.h5ad`; training with
+`--backed --multires_anchor_subsample 4000` and a batch size of 8 peaked at
+1.2 GB of GPU memory.
