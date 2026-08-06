@@ -878,8 +878,8 @@ class StratifiedZINBDataDecoder(DataDecoder):
                 if self.use_attn:
                     prenorm = self.prenorm_layers[k - 1](v)
                     qk = self.key_layers[k - 1](prenorm)
-                    v = self.value_layers[k - 1](prenorm)
-                    key = v + self.attn_layers[k - 1](qk, qk, prenorm)
+                    v_k = self.value_layers[k - 1](prenorm)
+                    key = v_k + self.attn_layers[k - 1](qk, qk, prenorm)
                     key = key + self.ff_activations[k - 1](self.ff_layers[k - 1](self.postnorm_layers[k - 1](key)))
                 else:
                     key = stratum_key_conv(self.key_convs[k - 1], v, k)
@@ -1347,7 +1347,9 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
     use_activation
         Whether to apply an activation after the stratum convolutions
     use_attn
-        Whether to additionally use local attention over anchor embeddings
+        Whether to additionally mix in surrounding anchors with local attention
+        (a pre-norm attention + feed-forward block on top of the anchored
+        stratum convolution). Requires an even ``embedding_size``.
     binarize
         Whether to model binarized contacts with a Bernoulli likelihood
     anchor_subsample
@@ -1356,6 +1358,17 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
     cell_strata_weights
         Whether the split of the library size across strata is predicted from
         the cell latent instead of being shared by all cells
+    attn_window
+        Local attention window in anchors, by default derived from the number
+        of strata
+    checkpoint
+        Whether to recompute the stratum keys during the backward pass instead
+        of storing their activations (slower, but much lighter)
+    key_checkpoint_min_anchors
+        Resolutions with more anchors than this recompute their attention keys
+        during the backward pass even when ``checkpoint`` is off. The keys do
+        not depend on the minibatch, so recomputing them is cheap relative to
+        the activations local attention would otherwise keep.
     """
 
     def __init__(
@@ -1363,9 +1376,12 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
             embedding_size: int = 50,
             res_specs: Optional[List[ResolutionSpec]] = None,
             shifted_additive: bool = False, use_activation: bool = False,
-            use_attn: bool = False, binarize: bool = False,
+            use_attn: bool = True, binarize: bool = False,
             anchor_subsample: Optional[int] = None,
-            cell_strata_weights: bool = True
+            cell_strata_weights: bool = True,
+            attn_window: Optional[int] = None,
+            checkpoint: bool = False,
+            key_checkpoint_min_anchors: int = 4096
     ) -> None:
         super().__init__(out_features, n_batches=n_batches)
         if not res_specs:
@@ -1377,6 +1393,7 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
         self.use_attn = use_attn
         self.binarize = binarize
         self.anchor_subsample = anchor_subsample
+        self.checkpoint = checkpoint
 
         self.scale_lin = torch.nn.Parameter(torch.zeros(n_batches, out_features))
         self.bias = torch.nn.Parameter(torch.zeros(n_batches, out_features))
@@ -1388,7 +1405,8 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
 
         self.cell_strata_weights = cell_strata_weights
         key_convs, key_acts, attn_layers, strata_weights = [], [], [], []
-        weight_heads = []
+        weight_heads, attn_windows = [], []
+        prenorms, postnorms, qk_layers, ff_layers = [], [], [], []
         for i, spec in enumerate(res_specs):
             res_convs = torch.nn.ModuleList([
                 torch.nn.Conv1d(
@@ -1402,11 +1420,38 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
                 for _ in range(1, spec.n_strata)
             ]))
             if use_attn:
+                if embedding_size % 2:
+                    raise ValueError(
+                        f"Local attention needs an even feature latent "
+                        f"dimensionality, got {embedding_size}. Use an even "
+                        f"`latent_dim` or disable attention."
+                    )
+                # The window is tied to the band height: contacts further apart
+                # than the band are not modelled anyway, and a wide window over
+                # a high resolution anchor sequence is expensive.
+                window = attn_window or min(max(4 * spec.n_strata, 32), 256)
+                attn_windows.append(window)
                 attn_layers.append(torch.nn.ModuleList([
                     LocalAttention(
-                        dim=embedding_size, window_size=spec.n_strata * 20,
+                        dim=embedding_size, window_size=window,
                         autopad=True, shared_qk=True
                     ) for _ in range(1, spec.n_strata)
+                ]))
+                prenorms.append(torch.nn.ModuleList([
+                    torch.nn.LayerNorm(embedding_size)
+                    for _ in range(1, spec.n_strata)
+                ]))
+                postnorms.append(torch.nn.ModuleList([
+                    torch.nn.LayerNorm(embedding_size)
+                    for _ in range(1, spec.n_strata)
+                ]))
+                qk_layers.append(torch.nn.ModuleList([
+                    torch.nn.Linear(embedding_size, embedding_size, bias=False)
+                    for _ in range(1, spec.n_strata)
+                ]))
+                ff_layers.append(torch.nn.ModuleList([
+                    torch.nn.Linear(embedding_size, embedding_size * 2, bias=False)
+                    for _ in range(1, spec.n_strata)
                 ]))
             strata_weights.append(torch.nn.Parameter(torch.ones(spec.n_strata)))
             if cell_strata_weights:
@@ -1422,10 +1467,25 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
         self.band_complete = [bool((spec.band_idx >= 0).all()) for spec in res_specs]
         self.key_convs_by_res = torch.nn.ModuleList(key_convs)
         self.key_conv_activations_by_res = torch.nn.ModuleList(key_acts)
-        self.attn_layers_by_res = torch.nn.ModuleList(attn_layers) if use_attn else None
         self.strata_weights_by_res = torch.nn.ParameterList(strata_weights)
         self.strata_weight_heads = torch.nn.ModuleList(weight_heads) \
             if cell_strata_weights else None
+        self.attn_windows = attn_windows
+        # Attention over a long anchor sequence is the memory-dominant part of
+        # the decoder, so trade it for compute where the sequence is long
+        self.auto_checkpoint = [
+            use_attn and spec.n_anchors > key_checkpoint_min_anchors
+            for spec in res_specs
+        ]
+        if use_attn:
+            self.attn_layers_by_res = torch.nn.ModuleList(attn_layers)
+            self.prenorm_layers_by_res = torch.nn.ModuleList(prenorms)
+            self.postnorm_layers_by_res = torch.nn.ModuleList(postnorms)
+            self.qk_layers_by_res = torch.nn.ModuleList(qk_layers)
+            self.ff_layers_by_res = torch.nn.ModuleList(ff_layers)
+            self.ff_activation = GEGLU()
+        else:
+            self.attn_layers_by_res = None
 
     def stratum_weights(self, res_i: int, u: torch.Tensor) -> torch.Tensor:
         r"""
@@ -1488,18 +1548,55 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
         keep = cols >= 0  # drop structural padding
         return FeatureSubset(cols[keep], res_of_col[keep], anchors)
 
-    def _stratum_keys(self, res_i: int, v: torch.Tensor, k: int) -> torch.Tensor:
+    def stratum_keys(self, res_i: int, v: torch.Tensor, k: int) -> torch.Tensor:
+        r"""
+        Feature latent used to reconstruct stratum ``k`` of a resolution
+
+        The stratum convolution pairs every anchor with the partner it actually
+        interacts with at this distance; local attention then mixes in the
+        surrounding anchors, as a pre-norm block so that the anchored pair stays
+        the residual base. Note that ``v`` is never rebound, so every stratum is
+        a function of the feature latent rather than of the previous stratum.
+
+        Parameters
+        ----------
+        res_i
+            Resolution index
+        v
+            Feature latent of this resolution
+            (:math:`n_{anchors} \times n_{dim}`)
+        k
+            Diagonal stratum
+
+        Returns
+        -------
+        key
+            Stratum-specific feature latent
+        """
         if k == 0:
             return v
         key = stratum_key_conv(self.key_convs_by_res[res_i][k - 1], v, k)
         if self.use_activation:
             key = self.key_conv_activations_by_res[res_i][k - 1](key)
         if self.use_attn:
-            attn = self.attn_layers_by_res[res_i][k - 1]
-            key = key + attn(
-                key.unsqueeze(0), key.unsqueeze(0), v.unsqueeze(0)
+            prenorm = self.prenorm_layers_by_res[res_i][k - 1](key)
+            qk = self.qk_layers_by_res[res_i][k - 1](prenorm).unsqueeze(0)
+            key = key + self.attn_layers_by_res[res_i][k - 1](
+                qk, qk, prenorm.unsqueeze(0)
             ).squeeze(0)
+            key = key + self.ff_activation(
+                self.ff_layers_by_res[res_i][k - 1](
+                    self.postnorm_layers_by_res[res_i][k - 1](key)
+                )
+            )
         return key
+
+    def _stratum_keys(self, res_i: int, v: torch.Tensor, k: int) -> torch.Tensor:
+        if self.training and (self.checkpoint or self.auto_checkpoint[res_i]):
+            return torch.utils.checkpoint.checkpoint(
+                self.stratum_keys, res_i, v, k, use_reentrant=False
+            )
+        return self.stratum_keys(res_i, v, k)
 
     def forward(  # pylint: disable=arguments-differ
             self, u: torch.Tensor, v: torch.Tensor,

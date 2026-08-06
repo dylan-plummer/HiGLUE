@@ -79,8 +79,15 @@ resolution:
 | `--multires_mlp_max_band` | bands larger than this are encoded with convolutions instead of a dense projection |
 | `--multires_res_dim` | size of each per-resolution embedding (default `--h_dim`) |
 | `--multires_anchor_subsample` | anchors per resolution reconstructed in each training step |
+| `--multires_use_attn` / `--no-multires_use_attn` | local attention over anchor embeddings in the decoder, on top of the stratum convolution that pairs anchor *i* with anchor *i+k* (on by default) |
+| `--multires_attn_window` | attention window in anchors; defaults to 4× the strata of each resolution, clamped to 32–256 |
 | `--multires_checkpoint` | recompute the per-resolution encoders in the backward pass (less GPU memory, more compute) |
 | `--backed` | read the Hi-C matrix from disk one minibatch at a time |
+
+Attention keys do not depend on the minibatch, so for resolutions with more
+than 4096 anchors they are recomputed in the backward pass automatically —
+enabling attention costs compute (~50% per epoch in our tests) but essentially
+no extra memory. `latent_dim` must be even when attention is enabled.
 
 After training, the fused embedding is stored in `hic.obsm["X_glue"]` and the
 per-resolution parts in `hic.obsm["X_glue_<resolution>"]`.

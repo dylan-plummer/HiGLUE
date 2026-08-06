@@ -1002,7 +1002,8 @@ class SCGLUEModel(Model):
             multires_conv_patch: Tuple[int, int] = (2, 8),
             multires_conv_pool_width: int = 32,
             multires_anchor_subsample: Optional[int] = None,
-            multires_use_attn: bool = False,
+            multires_use_attn: bool = True,
+            multires_attn_window: Optional[int] = None,
             multires_checkpoint: bool = False,
             random_seed: int = 0
     ) -> None:
@@ -1040,6 +1041,10 @@ class SCGLUEModel(Model):
                     "Multi-resolution Hi-C modality '%s': %s",
                     k, ", ".join(repr(spec) for spec in res_specs)
                 )
+                if multires_use_attn:
+                    self.logger.info(
+                        "Decoding '%s' with local attention over anchors", k
+                    )
                 idx[k] = self.vertices.get_indexer(anchor_names).astype(np.int64)
                 if idx[k].min() < 0:
                     missing = [
@@ -1097,7 +1102,9 @@ class SCGLUEModel(Model):
                     use_attn=multires_use_attn,
                     binarize=binarize,
                     anchor_subsample=multires_anchor_subsample,
-                    cell_strata_weights=cell_strata_weights
+                    cell_strata_weights=cell_strata_weights,
+                    attn_window=multires_attn_window,
+                    checkpoint=multires_checkpoint
                 )
             elif data_config["prob_model"] in HIC_PROB_MODELS:
                 strata_masks = []

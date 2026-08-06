@@ -290,7 +290,16 @@ if __name__ == '__main__':
     glue_parser.add_argument('--multires_conv_patch', nargs=2, type=int,
                              default=(2, 8))
     glue_parser.add_argument('--multires_conv_pool_width', type=int, default=32)
-    glue_parser.add_argument('--multires_use_attn', action='store_true')
+    glue_parser.add_argument(
+        '--multires_use_attn', action=argparse.BooleanOptionalAction, default=True,
+        help='use local attention over anchor embeddings in the '
+             'multi-resolution decoder (on by default)'
+    )
+    glue_parser.add_argument(
+        '--multires_attn_window', type=int, default=None,
+        help='local attention window in anchors; defaults to 4x the number of '
+             'strata of each resolution (clamped to 32-256)'
+    )
     glue_parser.add_argument(
         '--multires_checkpoint', action='store_true',
         help='recompute the per-resolution encoders during the backward pass '
@@ -670,6 +679,7 @@ if __name__ == '__main__':
                 "multires_conv_patch": tuple(args.multires_conv_patch),
                 "multires_conv_pool_width": args.multires_conv_pool_width,
                 "multires_anchor_subsample": args.multires_anchor_subsample,
+                "multires_attn_window": args.multires_attn_window,
                 "multires_checkpoint": args.multires_checkpoint
             })
         glue = scglue.models.fit_SCGLUE(
