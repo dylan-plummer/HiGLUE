@@ -85,6 +85,25 @@ resolution:
 After training, the fused embedding is stored in `hic.obsm["X_glue"]` and the
 per-resolution parts in `hic.obsm["X_glue_<resolution>"]`.
 
+`--use_dist_norm` and `--use_trans` apply to the pseudobulk edges of the
+guidance graph. Contacts are always ranked within a stratum (i.e.
+observed/expected by construction); `--use_dist_norm` additionally divides them
+by the coverage of their two anchors. `--use_trans` adds top trans-chromosomal
+edges, summarized at the coarsest resolution only — a dense trans matrix is
+quadratic in the number of bins, and the hierarchy edges propagate the
+connection down to finer resolutions.
+
+## Embedding quality options
+
+These apply to both single- and multi-resolution models.
+
+| Option | Meaning |
+| --- | --- |
+| `--strata_weights {cell,global}` | how the library size is split across strata. `cell` (default) predicts the split from the cell embedding, so the model can represent per-cell distance-decay (cell cycle, chromatin condensation); `global` shares one profile across all cells, as before |
+| `--no_strata_input_norm` | disable dividing each stratum by its typical magnitude before the encoder's log transform. Without it, the input is dominated by the first strata |
+| `--lam_downsample` | weight of a depth-consistency loss: each Hi-C cell is also encoded after binomial downsampling, and the two embeddings are pulled together. This makes the embedding depth-invariant by construction rather than only discouraging depth adversarially. Costs one extra encoder pass per step |
+| `--downsample_min` / `--downsample_max` | range the downsampling rate is drawn from (default 0.3–0.9) |
+
 ### Large and high resolution datasets
 
 High resolution representations are built without ever materializing a dense

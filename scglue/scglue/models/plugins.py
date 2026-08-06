@@ -900,11 +900,11 @@ class EmbeddingVisualizer(TrainingPlugin):
 
 
 
-                transfer_labels(self.rna, self.hic, "celltype", use_rep="X_glue", n_neighbors=10, key_added="pred_celltype")
+                transfer_labels(self.rna, self.hic, "celltype", use_rep="X_glue", n_neighbors=10, key_added="pred_celltype", metric="cosine")
                 if self.atac is not None:
-                    transfer_labels(self.rna, self.atac, "celltype", use_rep="X_glue", n_neighbors=10, key_added="pred_celltype")
+                    transfer_labels(self.rna, self.atac, "celltype", use_rep="X_glue", n_neighbors=10, key_added="pred_celltype", metric="cosine")
                 if self.methyl is not None:
-                    transfer_labels(self.rna, self.methyl, "celltype", use_rep="X_glue", n_neighbors=10, key_added="pred_celltype")
+                    transfer_labels(self.rna, self.methyl, "celltype", use_rep="X_glue", n_neighbors=10, key_added="pred_celltype", metric="cosine")
 
                 # compute pca
                 pca_out_dir = f'{self.out_dir}/pca'
@@ -1177,7 +1177,7 @@ class EmbeddingVisualizer(TrainingPlugin):
                     celltypes = sorted(sorted_hic.obs['celltype'].unique())
                     celltype_map = {c: i for i, c in enumerate(celltypes)}
                     sorted_hic.obs['celltype_int'] = sorted_hic.obs['celltype'].map(celltype_map)
-                    transfer_labels(sorted_rna, sorted_hic, "celltype", use_rep="X_glue", n_neighbors=5, key_added="pred_celltype_sorted")
+                    transfer_labels(sorted_rna, sorted_hic, "celltype", use_rep="X_glue", n_neighbors=5, key_added="pred_celltype_sorted", metric="cosine")
                     sorted_hic.obs['pred_celltype_int'] = sorted_hic.obs['pred_celltype_sorted'].map(celltype_map)
                     # measure accuracy
                     val_accuracy = accuracy_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])

@@ -264,6 +264,8 @@ class SCGLUETrainer(GLUETrainer):
             self, net: SCGLUE, lam_data: float = None, lam_kl: float = None,
             lam_graph: float = None, lam_align: float = None,
             lam_sup: float = None, lam_cycle: float = None, normalize_u: bool = None,
+            lam_downsample: float = 0.0, downsample_min: float = 0.3,
+            downsample_max: float = 0.9,
             modality_weight: Mapping[str, float] = None,
             optim: str = None, lr: float = None, **kwargs
     ) -> None:
@@ -279,6 +281,11 @@ class SCGLUETrainer(GLUETrainer):
         self.lam_sup = lam_sup
         self.lam_cycle = lam_cycle
         self.normalize_u = normalize_u
+        self.lam_downsample = lam_downsample or 0.0
+        self.downsample_min = downsample_min
+        self.downsample_max = downsample_max
+        if self.lam_downsample:
+            self.required_losses.append("downsample_loss")
         self.freeze_u = False
         if net.u2c:
             self.required_losses.append("sup_loss")
@@ -340,6 +347,52 @@ class SCGLUETrainer(GLUETrainer):
                 x_target[k] = subset.index_data(x[k])
                 l_target[k] = subset.library_size(x_target[k], net.u2x[k].n_res)
         return x_target, l_target
+
+    def downsample_consistency(
+            self, x: Mapping[str, torch.Tensor],
+            xrep: Mapping[str, torch.Tensor],
+            u: Mapping[str, D.Normal]
+    ) -> torch.Tensor:
+        r"""
+        Consistency between a cell and a downsampled copy of itself
+
+        Sequencing depth is the dominant confounder in single-cell Hi-C. Asking
+        the encoder to place a cell and a randomly downsampled version of it at
+        the same place in the latent space makes the embedding depth-invariant
+        by construction, rather than only discouraging depth information
+        adversarially.
+
+        Parameters
+        ----------
+        x
+            Data of each modality
+        xrep
+            Alternative input data of each modality
+        u
+            Latent distribution of each modality
+
+        Returns
+        -------
+        downsample_loss
+            Mean cosine distance between the two encodings
+        """
+        net = self.net
+        losses = []
+        for k in net.keys:
+            encoder = net.x2u[k]
+            if not getattr(encoder, "supports_downsample", False) or xrep[k].numel():
+                continue
+            keep = torch.empty(1, device=x[k].device).uniform_(
+                self.downsample_min, self.downsample_max
+            )
+            x_down = torch.binomial(x[k], keep.expand_as(x[k]))
+            u_down = encoder(x_down, xrep[k], lazy_normalizer=True)[0]
+            losses.append(
+                (1 - F.cosine_similarity(u[k].mean, u_down.mean, dim=1)).mean()
+            )
+        if not losses:
+            return torch.as_tensor(0.0, device=net.device)
+        return sum(losses) / len(losses)
 
     @staticmethod
     def decode(
@@ -503,9 +556,13 @@ class SCGLUETrainer(GLUETrainer):
         }
         x_elbo_sum = sum(self.modality_weight[k] * x_elbo[k] for k in net.keys)
 
+        downsample_loss = self.downsample_consistency(x, xrep, u) \
+            if self.lam_downsample else torch.as_tensor(0.0, device=net.device)
+
         vae_loss = self.lam_data * x_elbo_sum \
             + self.lam_graph * len(net.keys) * g_elbo \
-            + self.lam_sup * sup_loss
+            + self.lam_sup * sup_loss \
+            + self.lam_downsample * downsample_loss
 
         # cycle_loss = torch.tensor(0.0, device=self.net.device)
         # for source_key in net.keys:
@@ -538,6 +595,8 @@ class SCGLUETrainer(GLUETrainer):
             "vae_loss": vae_loss, "gen_loss": gen_loss,
             "g_nll": g_nll, "g_kl": g_kl, "g_elbo": g_elbo
         }
+        if self.lam_downsample:
+            losses["downsample_loss"] = downsample_loss
         for k in net.keys:
             losses.update({
                 f"x_{k}_nll": x_nll[k],
@@ -853,12 +912,16 @@ class PairedSCGLUETrainer(SCGLUETrainer):
         else:
             cos_loss = torch.as_tensor(0.0, device=net.device)
 
+        downsample_loss = self.downsample_consistency(x, xrep, u) \
+            if self.lam_downsample else torch.as_tensor(0.0, device=net.device)
+
         vae_loss = self.lam_data * x_elbo_sum \
             + self.lam_graph * len(net.keys) * g_elbo \
             + self.lam_sup * sup_loss \
             + self.lam_joint_cross * joint_cross_loss \
             + self.lam_real_cross * real_cross_loss \
-            + self.lam_cos * cos_loss
+            + self.lam_cos * cos_loss \
+            + self.lam_downsample * downsample_loss
         gen_loss = vae_loss - self.lam_align * dsc_loss - lam_depth * dsc_rds_loss
 
         losses = {
@@ -869,6 +932,8 @@ class PairedSCGLUETrainer(SCGLUETrainer):
             "real_cross_loss": real_cross_loss,
             "cos_loss": cos_loss
         }
+        if self.lam_downsample:
+            losses["downsample_loss"] = downsample_loss
         for k in net.keys:
             losses.update({
                 f"x_{k}_nll": x_nll[k],
@@ -929,6 +994,8 @@ class SCGLUEModel(Model):
             use_attn: bool = False,
             binarize: bool = False,
             n_strata: int = 5,
+            cell_strata_weights: bool = True,
+            strata_input_norm: bool = True,
             multires_res_dim: Optional[int] = None,
             multires_mlp_max_band: int = 262144,
             multires_conv_channels: Tuple[int, int, int] = (8, 16, 32),
@@ -1017,7 +1084,8 @@ class SCGLUEModel(Model):
                     conv_channels=multires_conv_channels,
                     conv_patch=multires_conv_patch,
                     conv_pool_width=multires_conv_pool_width,
-                    checkpoint=multires_checkpoint
+                    checkpoint=multires_checkpoint,
+                    strata_input_norm=strata_input_norm
                 )
                 u2x[k] = _DECODER_MAP[data_config["prob_model"]](
                     len(data_config["features"]),
@@ -1028,7 +1096,8 @@ class SCGLUEModel(Model):
                     use_activation=use_activation,
                     use_attn=multires_use_attn,
                     binarize=binarize,
-                    anchor_subsample=multires_anchor_subsample
+                    anchor_subsample=multires_anchor_subsample,
+                    cell_strata_weights=cell_strata_weights
                 )
             elif data_config["prob_model"] in HIC_PROB_MODELS:
                 strata_masks = []
@@ -1082,6 +1151,7 @@ class SCGLUEModel(Model):
                     h_depth=h_depth, h_dim=h_dim, dropout=dropout,
                     strata_masks=strata_masks,
                     use_conv=use_conv,
+                    strata_input_norm=strata_input_norm,
                     downsample_min=0.5, downsample_max=0.9
                 )
                 u2x[k] = _DECODER_MAP[data_config["prob_model"]](
@@ -1095,7 +1165,8 @@ class SCGLUEModel(Model):
                     shifted_additive=shifted_additive,
                     use_activation=use_activation,
                     use_attn=use_attn,
-                    binarize=binarize
+                    binarize=binarize,
+                    cell_strata_weights=cell_strata_weights
                 )
             else:
                 x2u[k] = _ENCODER_MAP[data_config["prob_model"]](
@@ -1191,6 +1262,9 @@ class SCGLUEModel(Model):
             lam_graph: float = 0.02,
             lam_align: float = 0.05,
             lam_sup: float = 0.02,
+            lam_downsample: float = 0.0,
+            downsample_min: float = 0.3,
+            downsample_max: float = 0.9,
             normalize_u: bool = False,
             modality_weight: Optional[Mapping[str, float]] = None,
             lr: float = 2e-3, **kwargs
@@ -1224,6 +1298,8 @@ class SCGLUEModel(Model):
         super().compile(
             lam_data=lam_data, lam_kl=lam_kl,
             lam_graph=lam_graph, lam_align=lam_align, lam_sup=lam_sup,
+            lam_downsample=lam_downsample, downsample_min=downsample_min,
+            downsample_max=downsample_max,
             normalize_u=normalize_u, modality_weight=modality_weight,
             optim="RMSprop", lr=lr, **kwargs
         )

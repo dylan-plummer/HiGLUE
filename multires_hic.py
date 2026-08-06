@@ -471,11 +471,62 @@ class BandStats:
         return dispersion, self.anchor_cells
 
 
+class TransStats:
+
+    r"""
+    Streaming pseudobulk statistics of trans-chromosomal contacts
+
+    Kept at a single (coarse) resolution: a dense trans matrix is quadratic in
+    the number of bins, so it is only affordable where bins are large.
+
+    Parameters
+    ----------
+    grid
+        Bin grid
+    max_elements
+        Refuse to allocate a matrix larger than this
+    """
+
+    def __init__(self, grid: ResolutionGrid, max_elements: float = 5e7) -> None:
+        self.grid = grid
+        self.n_cells = 0
+        if grid.n_bins ** 2 > max_elements:
+            raise ValueError(
+                f"A trans matrix at resolution '{grid.name}' would need "
+                f"{grid.n_bins ** 2:,} entries; use a coarser resolution for "
+                f"trans contacts or raise `max_elements`."
+            )
+        self.matrix = np.zeros((grid.n_bins, grid.n_bins), dtype=np.float32)
+
+    def update(
+            self, bin1: np.ndarray, bin2: np.ndarray, count: np.ndarray
+    ) -> None:
+        r"""
+        Accumulate the trans contacts of one cell
+        """
+        self.n_cells += 1
+        a1 = self.grid.base_to_bin[bin1]
+        a2 = self.grid.base_to_bin[bin2]
+        valid = (a1 >= 0) & (a2 >= 0)
+        a1, a2, count = a1[valid], a2[valid], count[valid]
+        trans = self.grid.chrom_code[a1] != self.grid.chrom_code[a2]
+        a1, a2, count = a1[trans], a2[trans], count[trans]
+        if not a1.size:
+            return
+        lo = np.minimum(a1, a2)
+        hi = np.maximum(a1, a2)
+        flat = lo * self.grid.n_bins + hi
+        cols, inverse = np.unique(flat, return_inverse=True)
+        values = np.bincount(inverse, weights=count).astype(np.float32)
+        self.matrix.reshape(-1)[cols] += values  # `cols` is unique
+
+
 def collect_band_stats(
         reader: ScoolReader, cells: Sequence[str],
         grids: Mapping[str, ResolutionGrid], n_strata: Mapping[str, int],
-        max_cells: Optional[int] = None, random_state: int = 0
-) -> "Dict[str, BandStats]":
+        max_cells: Optional[int] = None, random_state: int = 0,
+        trans_res: Optional[str] = None
+) -> "Tuple[Dict[str, BandStats], Optional[TransStats]]":
     r"""
     Stream over cells and accumulate band statistics at every resolution
 
@@ -493,17 +544,22 @@ def collect_band_stats(
         Number of cells to use, by default all of them
     random_state
         Random seed used when subsampling cells
+    trans_res
+        Resolution at which to also accumulate trans-chromosomal contacts
 
     Returns
     -------
     stats
         Band statistics per resolution
+    trans
+        Trans-chromosomal statistics, or ``None``
     """
     cells = list(cells)
     if max_cells and max_cells < len(cells):
         rs = np.random.RandomState(random_state)
         cells = [cells[i] for i in sorted(rs.choice(len(cells), max_cells, replace=False))]
     stats = {res: BandStats(grids[res], n_strata[res]) for res in grids}
+    trans = TransStats(grids[trans_res]) if trans_res else None
     for cell in tqdm(cells, desc="Scanning cells"):
         try:
             bin1, bin2, count = reader.pixels(cell)
@@ -511,7 +567,9 @@ def collect_band_stats(
             continue
         for res, grid in grids.items():
             stats[res].update(*band_columns(grid, n_strata[res], bin1, bin2, count))
-    return stats
+        if trans is not None:
+            trans.update(bin1, bin2, count)
+    return stats, trans
 
 
 #----------------------------- Anchor selection --------------------------------
@@ -740,13 +798,13 @@ def anchor_bed(grid: ResolutionGrid, anchors: np.ndarray) -> pd.DataFrame:
 
 def loop_edges(
         stats: BandStats, anchors: np.ndarray, loop_q: float = 0.98,
-        min_stratum: int = 1
+        min_stratum: int = 1, coverage_norm: bool = False
 ) -> pd.DataFrame:
     r"""
     Top pseudobulk contacts of one resolution, as graph edges
 
     Contacts are ranked within each stratum, which makes the ranking
-    distance-normalized by construction.
+    observed/expected by construction.
 
     Parameters
     ----------
@@ -758,6 +816,10 @@ def loop_edges(
         Quantile cutoff applied within each stratum
     min_stratum
         First stratum to consider (stratum 0 is the diagonal)
+    coverage_norm
+        Whether to additionally divide contacts by the square root of the
+        product of their anchors' coverage (as in vanilla-coverage
+        normalization), so that highly covered bins do not dominate
 
     Returns
     -------
@@ -769,6 +831,10 @@ def loop_edges(
     kept[anchors] = True
     names = grid.names
     starts = grid.bins["chromStart"].to_numpy()
+    coverage = None
+    if coverage_norm:
+        coverage = np.sqrt(np.maximum(stats.anchor_sum, 0.0))
+        coverage[coverage == 0] = 1.0
     frames = []
     for k in range(max(1, min_stratum), stats.n_strata):
         target = anchors + k
@@ -783,6 +849,8 @@ def loop_edges(
         source_k, target_k, value = source_k[nonzero], target_k[nonzero], value[nonzero]
         if not source_k.size:
             continue
+        if coverage is not None:
+            value = value / (coverage[source_k] * coverage[target_k])
         rank = pd.Series(value).rank(pct=True).to_numpy()
         keep = rank >= np.quantile(rank, loop_q) if loop_q > 0 else np.ones_like(rank, dtype=bool)
         if not keep.any():
@@ -796,6 +864,79 @@ def loop_edges(
             "dist": np.abs(
                 starts[target_k].astype(np.float64) - starts[source_k]
             ) / 2e6
+        }))
+    if not frames:
+        return pd.DataFrame(columns=["source", "target", "weight", "dist"])
+    return pd.concat(frames, ignore_index=True)
+
+
+def trans_edges(
+        stats: TransStats, anchors: np.ndarray, loop_q: float = 0.98,
+        coverage_norm: bool = False
+) -> pd.DataFrame:
+    r"""
+    Top pseudobulk trans-chromosomal contacts, as graph edges
+
+    The cutoff is relaxed per chromosome pair the same way the
+    single-resolution pipeline does it, so that the total number of trans edges
+    is comparable to the number of cis edges kept at ``loop_q``.
+
+    Parameters
+    ----------
+    stats
+        Trans-chromosomal statistics
+    anchors
+        Retained anchor indices of the same resolution
+    loop_q
+        Cis quantile cutoff the trans cutoff is derived from
+    coverage_norm
+        Whether to divide contacts by the square root of the product of their
+        anchors' trans coverage
+
+    Returns
+    -------
+    edges
+        Edge table with ``source``, ``target``, ``weight`` and ``dist``
+    """
+    grid = stats.grid
+    chrom_code = grid.chrom_code
+    n_chrom = int(chrom_code.max()) + 1
+    if n_chrom < 2:
+        return pd.DataFrame(columns=["source", "target", "weight", "dist"])
+    n_pairs = n_chrom * (n_chrom - 1) / 2
+    trans_q = max(0.0, 1 - (1 - loop_q) / n_pairs)
+
+    matrix = stats.matrix[np.ix_(anchors, anchors)]
+    matrix = matrix + matrix.T  # only one triangle was accumulated
+    codes = chrom_code[anchors]
+    names = grid.names[anchors]
+    coverage = None
+    if coverage_norm:
+        coverage = np.sqrt(np.maximum(matrix.sum(axis=1), 0.0))
+        coverage[coverage == 0] = 1.0
+    frames = []
+    for chrom in range(n_chrom):
+        rows = np.where(codes == chrom)[0]
+        cols = np.where(codes != chrom)[0]
+        if not rows.size or not cols.size:
+            continue
+        block = matrix[np.ix_(rows, cols)]
+        source_i, target_i = np.nonzero(block)
+        if not source_i.size:
+            continue
+        value = block[source_i, target_i]
+        source_i, target_i = rows[source_i], cols[target_i]
+        if coverage is not None:
+            value = value / (coverage[source_i] * coverage[target_i])
+        rank = pd.Series(value).rank(pct=True).to_numpy()
+        keep = rank >= np.quantile(rank, trans_q)
+        if not keep.any():
+            continue
+        frames.append(pd.DataFrame({
+            "source": names[source_i[keep]],
+            "target": names[target_i[keep]],
+            "weight": pd.Series(rank[keep]).rank(pct=True).to_numpy(),
+            "dist": 1.0
         }))
     if not frames:
         return pd.DataFrame(columns=["source", "target", "weight", "dist"])

@@ -363,6 +363,16 @@ def load_methyl_modality(methyl_file, rna, gtf_file, n_genes, plot_dir):
     return methyl, methyl_genes
 
 
+def multires_extra_suffix(use_dist_norm, use_trans):
+    """File name marker for pseudobulk edge options in multi-resolution mode."""
+    parts = []
+    if use_dist_norm:
+        parts.append('oe')
+    if use_trans:
+        parts.append('trans')
+    return '-'.join(parts)
+
+
 def _add_edges(graph, edges, edge_type, sign=1, symmetric=True):
     """Add an edge table (``source``/``target``/``weight``/``dist``) to a graph."""
     for row in edges.itertuples(index=False):
@@ -403,6 +413,8 @@ def preprocess_higlue_multires(args, glue_args):
     n_strata_map = {res: int(s) for res, s in zip(resolutions, strata_list)}
     max_anchors_map = {res: int(a or 0) for res, a in zip(resolutions, anchors_list)}
     loop_q = float(args.loop_q)
+    use_trans = args.use_trans
+    use_dist_norm = args.use_dist_norm
     use_xy = args.use_xy
     n_genes = args.n_genes
     gtf_file = args.gtf
@@ -454,9 +466,15 @@ def preprocess_higlue_multires(args, glue_args):
                   f'(up to {n_strata_map[res] * mh.parse_resolution(res) / 1e6:.2f} Mb)')
 
         print('Collecting band statistics...')
-        stats = mh.collect_band_stats(
+        # trans contacts are only summarized at the coarsest resolution: a
+        # dense trans matrix is quadratic in the number of bins
+        trans_res = resolutions[0] if use_trans else None
+        if trans_res is not None:
+            print(f'  also collecting trans contacts at {trans_res}')
+        stats, trans_stats = mh.collect_band_stats(
             reader, cells, grids, n_strata_map,
-            max_cells=args.multires_stat_cells, random_state=args.seed
+            max_cells=args.multires_stat_cells, random_state=args.seed,
+            trans_res=trans_res
         )
         min_cells = max(3, int(args.multires_min_frac * stats[resolutions[0]].n_cells))
 
@@ -503,12 +521,22 @@ def preprocess_higlue_multires(args, glue_args):
                 )
                 print(f'  {res}: {dist_graph.number_of_edges():,} promoter distance edges')
 
-            loops = mh.loop_edges(stats[res], anchors[res], loop_q=loop_q)
+            loops = mh.loop_edges(
+                stats[res], anchors[res], loop_q=loop_q,
+                coverage_norm=use_dist_norm
+            )
             _add_edges(prior, loops, "hic")
             adjacent = mh.adjacency_edges(grids[res], anchors[res])
             _add_edges(prior, adjacent, "hic")
             print(f'  {res}: {loops.shape[0]:,} contact edges, '
                   f'{adjacent.shape[0]:,} adjacency edges')
+            if trans_stats is not None and res == trans_res:
+                trans = mh.trans_edges(
+                    trans_stats, anchors[res], loop_q=loop_q,
+                    coverage_norm=use_dist_norm
+                )
+                _add_edges(prior, trans, "trans")
+                print(f'  {res}: {trans.shape[0]:,} trans contact edges')
 
         for coarse, fine in zip(resolutions[:-1], resolutions[1:]):
             links = mh.hierarchy_edges(
@@ -627,7 +655,10 @@ def preprocess_higlue_multires(args, glue_args):
             cell.replace(f'.{dataset.res_name}', '') for cell in cells
         ]))
 
-        suffix = mh.multires_suffix(resolutions, [n_strata_map[r] for r in resolutions], loop_q)
+        suffix = mh.multires_suffix(
+            resolutions, [n_strata_map[r] for r in resolutions], loop_q,
+            extra=multires_extra_suffix(use_dist_norm, use_trans)
+        )
         hic_path = f"{out_dir}/hic/hic_{suffix}.h5ad"
         print(f'Streaming cells into {hic_path} ...')
         depths = mh.write_multires_hic(

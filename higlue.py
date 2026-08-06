@@ -14,7 +14,9 @@ import torch
 from matplotlib.colors import Normalize
 from scipy.stats import pearsonr
 from sklearn.metrics import accuracy_score, adjusted_rand_score, silhouette_score
-from preprocess_data import preprocess_higlue, preprocess_higlue_multires
+from preprocess_data import (
+    preprocess_higlue, preprocess_higlue_multires, multires_extra_suffix
+)
 import multires_hic as mh
 
 
@@ -215,6 +217,24 @@ if __name__ == '__main__':
     glue_parser.add_argument('--use_rna_pca', action='store_true')
     glue_parser.add_argument('--use_atac_counts', action='store_true')
     glue_parser.add_argument('--cache_checkpoint', type=str, default=None)
+    glue_parser.add_argument(
+        '--strata_weights', choices=['cell', 'global'], default='cell',
+        help="how the library size is split across strata: 'cell' predicts it "
+             "from the cell embedding (lets the model represent per-cell "
+             "distance decay), 'global' shares one profile across all cells"
+    )
+    glue_parser.add_argument(
+        '--no_strata_input_norm', action='store_true',
+        help='do not divide each stratum by its typical magnitude before the '
+             'log transform of the encoder input'
+    )
+    glue_parser.add_argument(
+        '--lam_downsample', type=float, default=0.0,
+        help='weight of the depth consistency loss, which pulls a cell and a '
+             'downsampled copy of it to the same embedding (0 disables it)'
+    )
+    glue_parser.add_argument('--downsample_min', type=float, default=0.3)
+    glue_parser.add_argument('--downsample_max', type=float, default=0.9)
 
     # multi-resolution args
     glue_parser.add_argument(
@@ -351,7 +371,10 @@ if __name__ == '__main__':
             default=n_strata
         )
         multires_strata = [int(s) for s in multires_strata]
-        full_file_suffix = mh.multires_suffix(resolutions, multires_strata, float(loop_q))
+        full_file_suffix = mh.multires_suffix(
+            resolutions, multires_strata, float(loop_q),
+            extra=multires_extra_suffix(args.use_dist_norm, args.use_trans)
+        )
         graph_file_suffix = f"{prior_name}_prior_{full_file_suffix}"
         print(f"Multi-resolution mode: {list(zip(resolutions, multires_strata))}")
 
@@ -634,6 +657,8 @@ if __name__ == '__main__':
                     "h_dim": h_dim,
                     "h_depth": h_depth,
                     "n_strata": n_strata,
+                    "cell_strata_weights": args.strata_weights == 'cell',
+                    "strata_input_norm": not args.no_strata_input_norm,
                     "random_seed": seed}
         if multires:
             init_kws.update({
@@ -655,6 +680,9 @@ if __name__ == '__main__':
             compile_kws={"lam_align": lam_align, 
                         "lam_graph": lam_graph,
                         "lam_cycle": lam_cycle,
+                        "lam_downsample": args.lam_downsample,
+                        "downsample_min": args.downsample_min,
+                        "downsample_max": args.downsample_max,
                         "normalize_u": normalize_u,
                         "lr": lr,
                         "modality_weight": modality_weights},
@@ -713,7 +741,7 @@ if __name__ == '__main__':
             sc.tl.leiden(methyl)
 
         # transfer labels to predict celltypes
-        scglue.data.transfer_labels(rna, hic, "celltype", use_rep="X_glue", n_neighbors=n_neighbors)
+        scglue.data.transfer_labels(rna, hic, "celltype", use_rep="X_glue", n_neighbors=n_neighbors, metric="cosine")
         try:
             # map celltypes to integers
             celltypes = hic.obs['old_celltype'].unique()
@@ -753,7 +781,7 @@ if __name__ == '__main__':
             # if atac file is provided, do the same for atac
             if atac_file is not None:
                 try:
-                    scglue.data.transfer_labels(rna, atac, "celltype", use_rep="X_glue", n_neighbors=n_neighbors)
+                    scglue.data.transfer_labels(rna, atac, "celltype", use_rep="X_glue", n_neighbors=n_neighbors, metric="cosine")
                     atac_celltypes = atac.obs['old_celltype'].unique()
                     atac_celltype_map = {c: i for i, c in enumerate(atac_celltypes)}
                     atac.obs['old_celltype_int'] = atac.obs['old_celltype'].map(atac_celltype_map)
@@ -774,7 +802,7 @@ if __name__ == '__main__':
             # if methyl file is provided, do the same for methyl
             if methyl_file is not None:
                 try:
-                    scglue.data.transfer_labels(rna, methyl, "celltype", use_rep="X_glue", n_neighbors=n_neighbors)
+                    scglue.data.transfer_labels(rna, methyl, "celltype", use_rep="X_glue", n_neighbors=n_neighbors, metric="cosine")
                     methyl_celltypes = methyl.obs['old_celltype'].unique()
                     methyl_celltype_map = {c: i for i, c in enumerate(methyl_celltypes)}
                     methyl.obs['old_celltype_int'] = methyl.obs['old_celltype'].map(methyl_celltype_map)
@@ -905,7 +933,7 @@ if __name__ == '__main__':
                   'combined_umap_1': list(combined_hic_only.obsm['X_umap'][:, 0]),
                   'combined_umap_2': list(combined_hic_only.obsm['X_umap'][:, 1])}
             for neighbors in neighbors_list:
-                scglue.data.transfer_labels(rna, hic, "celltype", use_rep="X_glue", n_neighbors=neighbors)
+                scglue.data.transfer_labels(rna, hic, "celltype", use_rep="X_glue", n_neighbors=neighbors, metric="cosine")
                 df[f'celltype_{neighbors}'] = list(hic.obs['celltype'])
             df = pd.DataFrame(df)
             df['resolution'] = resolution
@@ -1044,7 +1072,7 @@ if __name__ == '__main__':
             celltype_map = {c: i for i, c in enumerate(celltypes)}
             sorted_hic.obs['celltype_int'] = sorted_hic.obs['celltype'].map(celltype_map)
             try:
-                scglue.data.transfer_labels(sorted_rna, sorted_hic, "celltype", use_rep="X_glue", n_neighbors=5, key_added="pred_celltype_sorted")
+                scglue.data.transfer_labels(sorted_rna, sorted_hic, "celltype", use_rep="X_glue", n_neighbors=5, key_added="pred_celltype_sorted", metric="cosine")
                 sorted_hic.obs['pred_celltype_int'] = sorted_hic.obs['pred_celltype_sorted'].map(celltype_map)
                 # measure accuracy
                 val_accuracy = accuracy_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
