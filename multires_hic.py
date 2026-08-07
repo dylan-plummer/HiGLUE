@@ -173,7 +173,12 @@ class ResolutionGrid:
             size = int(chromsizes[chrom])
             n = max(1, int(np.ceil(size / binsize)))
             start = np.arange(n, dtype=np.int64) * binsize
-            end = np.minimum(start + binsize, size)
+            # The last bin deliberately runs past the end of the chromosome.
+            # Clipping it to the chromosome length would let two resolutions
+            # produce the same bin name (e.g. the last 500kb and 200kb bins of
+            # a chromosome both clip to `chr2:182000000-182113224`), and bin
+            # names are what identify features and graph vertices.
+            end = start + binsize
             chroms.append(np.full(n, chrom, dtype=object))
             starts.append(start)
             ends.append(end)
@@ -1166,11 +1171,26 @@ class MultiResLayout:
     def var(self) -> pd.DataFrame:
         r"""
         Feature annotation of all resolutions, in feature order
+
+        Raises
+        ------
+        ValueError
+            If two resolutions produce the same feature name. Feature names
+            identify both model features and graph vertices, so a collision
+            would silently merge them.
         """
-        return pd.concat([
+        var = pd.concat([
             build_var(self.grids[res], self.anchors[res], self.n_strata[res])
             for res in self.res_order
         ])
+        if not var.index.is_unique:
+            duplicated = var.index[var.index.duplicated()].unique()
+            raise ValueError(
+                f"{duplicated.size} feature names are shared by more than one "
+                f"resolution (e.g. {list(duplicated[:3])}). Bin names must be "
+                f"unique across resolutions."
+            )
+        return var
 
     def row(
             self, bin1: np.ndarray, bin2: np.ndarray, count: np.ndarray

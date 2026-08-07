@@ -62,7 +62,20 @@ def build_multires_config(
             raise ValueError(
                 f"Multi-resolution data requires a '{key}' column in `adata.var`!"
             )
-    var = adata.var.loc[features, [res_key, stratum_key, anchor_key]]
+    if not adata.var_names.is_unique:
+        duplicated = adata.var_names[adata.var_names.duplicated()].unique()
+        raise ValueError(
+            f"Multi-resolution features must have unique names, but "
+            f"{duplicated.size} are duplicated (e.g. {list(duplicated[:3])}). "
+            f"Rerun preprocessing to rebuild the dataset."
+        )
+    columns = [res_key, stratum_key, anchor_key]
+    if len(features) == adata.n_vars and np.array_equal(
+        np.asarray(features), adata.var_names.to_numpy()
+    ):  # avoid a label lookup over millions of features
+        var = adata.var[columns]
+    else:
+        var = adata.var.loc[features, columns]
     feature_res = var[res_key].astype(str).to_numpy()
     feature_stratum = var[stratum_key].to_numpy().astype(np.int64)
     feature_anchor = var[anchor_key].astype(str).to_numpy()
