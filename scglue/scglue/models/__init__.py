@@ -10,6 +10,7 @@ import dill
 import networkx as nx
 import numpy as np
 import pandas as pd
+import torch
 from anndata import AnnData
 
 from ..data import estimate_balancing_weight
@@ -21,6 +22,11 @@ from .nn import autodevice
 from .scclue import SCCLUEModel
 from .scglue import PairedSCGLUEModel, SCGLUEModel
 from .plugins import EmbeddingVisualizer
+
+# Argument validation of torch distributions checks tensor values on the host,
+# i.e. synchronizes with the GPU every time a distribution is constructed or
+# evaluated, which happens many times per training step
+torch.distributions.Distribution.set_default_validate_args(False)
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

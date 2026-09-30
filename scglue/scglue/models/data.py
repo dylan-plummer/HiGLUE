@@ -155,6 +155,62 @@ class BackedMatrix:
         return np.ascontiguousarray(sub, dtype=self.dtype)
 
 
+#------------------------------ Negative sampling ------------------------------
+
+def _edge_keys(
+        i: np.ndarray, j: np.ndarray, s: np.ndarray, vnum: int
+) -> np.ndarray:
+    r"""
+    Encode (source, target, sign) edge triplets as unique integer keys
+    """
+    return (i.astype(np.int64) * vnum + j.astype(np.int64)) * 2 + (s > 0)
+
+
+def _in_sorted(keys: np.ndarray, query: np.ndarray) -> np.ndarray:
+    r"""
+    Vectorized membership test of ``query`` in the sorted array ``keys``
+    """
+    pos = np.minimum(np.searchsorted(keys, query), keys.size - 1)
+    return keys[pos] == query
+
+
+def _sample_edges(
+        dataset: Any, seed: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r"""
+    Sample positive edges by weight and ``neg_samples`` negative edges per
+    positive edge, resampling negatives that collide with an existing edge
+
+    Membership is checked with a binary search over sorted integer edge keys
+    instead of a Python set, which keeps resampling the graph every epoch
+    cheap enough not to stall training.
+    """
+    (pi, pj), pw, ps = dataset.eidx, dataset.ewt, dataset.esgn
+    rs = get_rs(seed)
+    psamp = rs.choice(dataset.ewt.size, dataset.n_pos, replace=True, p=dataset.eprob)
+    pi_, pj_, pw_, ps_ = pi[psamp], pj[psamp], pw[psamp], ps[psamp]
+    pw_ = np.ones_like(pw_)
+    ni_ = np.tile(pi_, dataset.neg_samples)
+    nw_ = np.zeros(pw_.size * dataset.neg_samples, dtype=pw_.dtype)
+    ns_ = np.tile(ps_, dataset.neg_samples)
+    nj_ = rs.choice(dataset.vnum, pj_.size * dataset.neg_samples, replace=True, p=dataset.vprob)
+
+    remain = np.where(_in_sorted(
+        dataset.ekey, _edge_keys(ni_, nj_, ns_, dataset.vnum)
+    ))[0]
+    while remain.size:  # NOTE: Potential infinite loop if graph too dense
+        newnj = rs.choice(dataset.vnum, remain.size, replace=True, p=dataset.vprob)
+        nj_[remain] = newnj
+        remain = remain[_in_sorted(
+            dataset.ekey, _edge_keys(ni_[remain], newnj, ns_[remain], dataset.vnum)
+        )]
+    idx = np.stack([np.concatenate([pi_, ni_]), np.concatenate([pj_, nj_])])
+    w = np.concatenate([pw_, nw_])
+    s = np.concatenate([ps_, ns_])
+    perm = rs.permutation(idx.shape[1])
+    return idx[:, perm], w[perm], s[perm]
+
+
 #---------------------------------- Datasets -----------------------------------
 
 @logged
@@ -437,6 +493,7 @@ class AnnDataset(Dataset):
         super().__init__(getitem_size=getitem_size)
         if mode not in ("train", "eval"):
             raise ValueError("Invalid `mode`!")
+        self.device: Optional[torch.device] = None  # Set by `to_device`
         self.mode = mode
         self.adatas = adatas
         self.data_configs = data_configs
@@ -502,6 +559,15 @@ class AnnDataset(Dataset):
             index * self.getitem_size,
             min((index + 1) * self.getitem_size, self.size)
         )
+        if self.device is not None:  # Data and shuffling live on the device
+            shuffle_idx = self._device_shuffle_idx[s].T
+            items = [
+                data.index_select(0, idx)
+                for extracted_data in self.extracted_data
+                for idx, data in zip(shuffle_idx, extracted_data)
+            ]
+            items.append(self._device_shuffle_pmsk[s])
+            return items
         shuffle_idx = self.shuffle_idx[s].T
         shuffle_pmsk = self.shuffle_pmsk[s]
         items = [
@@ -738,6 +804,61 @@ class AnnDataset(Dataset):
 
     def accept_shuffle(self, shuffled: Tuple[np.ndarray, np.ndarray]) -> None:
         self.shuffle_idx, self.shuffle_pmsk = shuffled
+        self._upload_shuffle()
+
+    def _upload_shuffle(self) -> None:
+        # One small copy per shuffle, instead of one per minibatch fetch
+        if self.device is not None:
+            self._device_shuffle_idx = torch.as_tensor(self.shuffle_idx, device=self.device)
+            self._device_shuffle_pmsk = torch.as_tensor(self.shuffle_pmsk, device=self.device)
+
+    def to_device(self, device: torch.device, max_bytes: float) -> bool:
+        r"""
+        Keep the (densified) data on a device, if they fit in ``max_bytes``
+
+        Minibatches are then gathered on the device, which removes the host
+        side slicing, densification, concatenation and transfer that
+        otherwise bound training speed on small and medium datasets.
+        Data read lazily from disk are always left there.
+
+        Parameters
+        ----------
+        device
+            Device to keep the data on
+        max_bytes
+            Largest size of the densified data to move
+
+        Returns
+        -------
+        moved
+            Whether the data were moved
+        """
+        arrays = [arr for group in self.extracted_data for arr in group]
+        if any(isinstance(arr, (BackedMatrix, ) + BACKED_TYPES) for arr in arrays):
+            return False
+        if any(np.dtype(arr.dtype) == object for arr in arrays):
+            return False
+        nbytes = sum(
+            int(np.prod(arr.shape)) * np.dtype(arr.dtype).itemsize for arr in arrays
+        )
+        if nbytes > max_bytes:
+            self.logger.info(
+                "Data (%.2f GiB dense) exceed the device budget (%.2f GiB), "
+                "minibatches are assembled on the host", nbytes / 2 ** 30, max_bytes / 2 ** 30
+            )
+            return False
+        self.extracted_data = tuple(
+            [
+                torch.as_tensor(
+                    arr.toarray() if scipy.sparse.issparse(arr) else np.asarray(arr),
+                    device=device
+                ) for arr in group
+            ] for group in self.extracted_data
+        )
+        self.device = torch.device(device)
+        self._upload_shuffle()
+        self.logger.info("Keeping data on %s (%.2f GiB)", self.device, nbytes / 2 ** 30)
+        return True
 
     def random_split(
             self, fractions: List[float], random_state: RandomState = None
@@ -773,6 +894,7 @@ class AnnDataset(Dataset):
             sub.view_idx = idx
             sub.size = idx.size
             sub.shuffle_idx, sub.shuffle_pmsk = sub._get_idx_pmsk(idx)  # pylint: disable=protected-access
+            sub._upload_shuffle()  # pylint: disable=protected-access
             subdatasets.append(sub)
         return subdatasets
     
@@ -813,12 +935,9 @@ class GraphDatasetWithAttr(Dataset):
         self.use_node_attributes = use_node_attributes
         self.eidx, self.ewt, self.esgn = \
             self.graph2triplet(graph, vertices)
-        self.eset = {
-            (i, j, s) for (i, j), s in
-            zip(self.eidx.T, self.esgn)
-        }
         
         self.vnum = self.eidx.max() + 1
+        self.ekey = np.unique(_edge_keys(*self.eidx, self.esgn, self.vnum))
         if weighted_sampling:
             if deemphasize_loops:
                 non_loop = self.eidx[0] != self.eidx[1]
@@ -841,7 +960,8 @@ class GraphDatasetWithAttr(Dataset):
         self.effective_enum = round(effective_enum)
 
         self.neg_samples = neg_samples
-        self.size = self.effective_enum * (1 + self.neg_samples)
+        self.n_pos = self.effective_enum  # Positive edges sampled per shuffle
+        self.size = self.n_pos * (1 + self.neg_samples)
         self.samp_eidx: Optional[np.ndarray] = None
         self.samp_ewt: Optional[np.ndarray] = None
         self.samp_esgn: Optional[np.ndarray] = None
@@ -921,35 +1041,33 @@ class GraphDatasetWithAttr(Dataset):
             torch.as_tensor(self.node_attr_mat)
         ]
 
+    def limit_epoch(self, n_edges: Optional[int]) -> None:
+        r"""
+        Sample only as many edges per shuffle as one pass will consume
+
+        The graph is resampled whenever a data loader starts iterating over
+        it, but a pass only consumes as many graph batches as there are data
+        batches. When the data are small, sampling the whole graph every time
+        wastes most of the work and can stall training.
+
+        Parameters
+        ----------
+        n_edges
+            Number of (positive and negative) edges needed per pass, or
+            ``None`` to sample the whole graph
+        """
+        if self.has_workers:
+            raise RuntimeError("Call `limit_epoch` before `prepare_shuffle`!")
+        n_pos = self.effective_enum
+        if n_edges is not None:
+            n_pos = min(n_pos, max(1, ceil(n_edges / (1 + self.neg_samples))))
+        self.n_pos = n_pos
+        self.size = self.n_pos * (1 + self.neg_samples)
+
     def propose_shuffle(
             self, seed: int
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        (pi, pj), pw, ps = self.eidx, self.ewt, self.esgn
-        rs = get_rs(seed)
-        psamp = rs.choice(self.ewt.size, self.effective_enum, replace=True, p=self.eprob)
-        pi_, pj_, pw_, ps_ = pi[psamp], pj[psamp], pw[psamp], ps[psamp]
-        pw_ = np.ones_like(pw_)
-        ni_ = np.tile(pi_, self.neg_samples)
-        nw_ = np.zeros(pw_.size * self.neg_samples, dtype=pw_.dtype)
-        ns_ = np.tile(ps_, self.neg_samples)
-        nj_ = rs.choice(self.vnum, pj_.size * self.neg_samples, replace=True, p=self.vprob)
-
-        remain = np.where([
-            item in self.eset
-            for item in zip(ni_, nj_, ns_)
-        ])[0]
-        while remain.size:  # NOTE: Potential infinite loop if graph too dense
-            newnj = rs.choice(self.vnum, remain.size, replace=True, p=self.vprob)
-            nj_[remain] = newnj
-            remain = remain[[
-                item in self.eset
-                for item in zip(ni_[remain], newnj, ns_[remain])
-            ]]
-        idx = np.stack([np.concatenate([pi_, ni_]), np.concatenate([pj_, nj_])])
-        w = np.concatenate([pw_, nw_])
-        s = np.concatenate([ps_, ns_])
-        perm = rs.permutation(idx.shape[1])
-        return idx[:, perm], w[perm], s[perm]
+        return _sample_edges(self, seed)
 
     def accept_shuffle(
             self, shuffled: Tuple[np.ndarray, np.ndarray, np.ndarray]
@@ -991,12 +1109,9 @@ class GraphDataset(Dataset):
         super().__init__(getitem_size=getitem_size)
         self.eidx, self.ewt, self.esgn = \
             self.graph2triplet(graph, vertices)
-        self.eset = {
-            (i, j, s) for (i, j), s in
-            zip(self.eidx.T, self.esgn)
-        }
 
         self.vnum = self.eidx.max() + 1
+        self.ekey = np.unique(_edge_keys(*self.eidx, self.esgn, self.vnum))
         if weighted_sampling:
             if deemphasize_loops:
                 non_loop = self.eidx[0] != self.eidx[1]
@@ -1019,7 +1134,8 @@ class GraphDataset(Dataset):
         self.effective_enum = round(effective_enum)
 
         self.neg_samples = neg_samples
-        self.size = self.effective_enum * (1 + self.neg_samples)
+        self.n_pos = self.effective_enum  # Positive edges sampled per shuffle
+        self.size = self.n_pos * (1 + self.neg_samples)
         self.samp_eidx: Optional[np.ndarray] = None
         self.samp_ewt: Optional[np.ndarray] = None
         self.samp_esgn: Optional[np.ndarray] = None
@@ -1083,35 +1199,33 @@ class GraphDataset(Dataset):
             torch.as_tensor(self.samp_esgn[s])
         ]
 
+    def limit_epoch(self, n_edges: Optional[int]) -> None:
+        r"""
+        Sample only as many edges per shuffle as one pass will consume
+
+        The graph is resampled whenever a data loader starts iterating over
+        it, but a pass only consumes as many graph batches as there are data
+        batches. When the data are small, sampling the whole graph every time
+        wastes most of the work and can stall training.
+
+        Parameters
+        ----------
+        n_edges
+            Number of (positive and negative) edges needed per pass, or
+            ``None`` to sample the whole graph
+        """
+        if self.has_workers:
+            raise RuntimeError("Call `limit_epoch` before `prepare_shuffle`!")
+        n_pos = self.effective_enum
+        if n_edges is not None:
+            n_pos = min(n_pos, max(1, ceil(n_edges / (1 + self.neg_samples))))
+        self.n_pos = n_pos
+        self.size = self.n_pos * (1 + self.neg_samples)
+
     def propose_shuffle(
             self, seed: int
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        (pi, pj), pw, ps = self.eidx, self.ewt, self.esgn
-        rs = get_rs(seed)
-        psamp = rs.choice(self.ewt.size, self.effective_enum, replace=True, p=self.eprob)
-        pi_, pj_, pw_, ps_ = pi[psamp], pj[psamp], pw[psamp], ps[psamp]
-        pw_ = np.ones_like(pw_)
-        ni_ = np.tile(pi_, self.neg_samples)
-        nw_ = np.zeros(pw_.size * self.neg_samples, dtype=pw_.dtype)
-        ns_ = np.tile(ps_, self.neg_samples)
-        nj_ = rs.choice(self.vnum, pj_.size * self.neg_samples, replace=True, p=self.vprob)
-
-        remain = np.where([
-            item in self.eset
-            for item in zip(ni_, nj_, ns_)
-        ])[0]
-        while remain.size:  # NOTE: Potential infinite loop if graph too dense
-            newnj = rs.choice(self.vnum, remain.size, replace=True, p=self.vprob)
-            nj_[remain] = newnj
-            remain = remain[[
-                item in self.eset
-                for item in zip(ni_[remain], newnj, ns_[remain])
-            ]]
-        idx = np.stack([np.concatenate([pi_, ni_]), np.concatenate([pj_, nj_])])
-        w = np.concatenate([pw_, nw_])
-        s = np.concatenate([ps_, ns_])
-        perm = rs.permutation(idx.shape[1])
-        return idx[:, perm], w[perm], s[perm]
+        return _sample_edges(self, seed)
 
     def accept_shuffle(
             self, shuffled: Tuple[np.ndarray, np.ndarray, np.ndarray]
@@ -1205,6 +1319,7 @@ class ParallelDataLoader:
             raise e
 
     def __next__(self) -> List[torch.Tensor]:
+        # Pinned loaders return lists and unpinned ones tuples, so normalize
         return functools.reduce(
-            operator.add, [self._next(i) for i in range(self.num_loaders)]
+            operator.add, [list(self._next(i)) for i in range(self.num_loaders)]
         )

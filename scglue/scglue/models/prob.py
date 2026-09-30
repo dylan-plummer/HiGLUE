@@ -2,11 +2,15 @@ r"""
 Probability distributions
 """
 
+import math
+
 import torch
 import torch.distributions as D
 import torch.nn.functional as F
 
 from ..num import EPS
+
+LOG_EPS = math.log(EPS)
 
 
 #-------------------------------- Distributions --------------------------------
@@ -139,12 +143,18 @@ class ZINB(D.NegativeBinomial):
         self.zi_logits = zi_logits
 
     def log_prob(self, value: torch.Tensor) -> torch.Tensor:
+        # Computed densely with `torch.where` rather than boolean-mask indexing:
+        # masking synchronizes with the GPU and its backward is a slow scatter.
+        # log(exp(raw) + exp(zi) + EPS) is evaluated with a max shift so that
+        # neither branch overflows (an inf in the unselected branch would still
+        # turn its zero gradient into NaN).
         raw_log_prob = super().log_prob(value)
-        zi_log_prob = torch.empty_like(raw_log_prob)
-        z_mask = value.abs() < EPS
-        z_zi_logits, nz_zi_logits = self.zi_logits[z_mask], self.zi_logits[~z_mask]
-        zi_log_prob[z_mask] = (
-            raw_log_prob[z_mask].exp() + z_zi_logits.exp() + EPS
-        ).log() - F.softplus(z_zi_logits)
-        zi_log_prob[~z_mask] = raw_log_prob[~z_mask] - F.softplus(nz_zi_logits)
-        return zi_log_prob
+        zi_logits = self.zi_logits
+        softplus_zi = F.softplus(zi_logits)
+        shift = torch.maximum(raw_log_prob, zi_logits).clamp(min=LOG_EPS).detach()
+        z_log_prob = shift + (
+            (raw_log_prob - shift).exp() + (zi_logits - shift).exp()
+            + (LOG_EPS - shift).exp()
+        ).log() - softplus_zi
+        nz_log_prob = raw_log_prob - softplus_zi
+        return torch.where(value.abs() < EPS, z_log_prob, nz_log_prob)

@@ -193,11 +193,11 @@ if __name__ == '__main__':
 
     # extra training args
     glue_parser.add_argument('--prior', type=str, default='dcq')
-    glue_parser.add_argument('--hic_weight', type=str, default=10.0)
+    glue_parser.add_argument('--hic_weight', type=float, default=10.0)
     glue_parser.add_argument('--n_neighbors', type=int, default=15)
-    glue_parser.add_argument('--lam_align', type=str, default=0.01)
-    glue_parser.add_argument('--lam_graph', type=str, default=0.1)
-    glue_parser.add_argument('--lam_cycle', type=str, default=0.02)
+    glue_parser.add_argument('--lam_align', type=float, default=0.01)
+    glue_parser.add_argument('--lam_graph', type=float, default=0.1)
+    glue_parser.add_argument('--lam_cycle', type=float, default=0.02)
     glue_parser.add_argument('--suffix', type=str, default='2d')
     glue_parser.add_argument('--exp_name', type=str, default=None)
     glue_parser.add_argument('--save_interval', type=int, default=100)
@@ -593,14 +593,27 @@ if __name__ == '__main__':
                             'neg_samples': neg_samples,
                             'use_trans': use_trans,
                             'normalize_u': normalize_u,
-                            'use_attn': use_attn,
+                            'use_attn': args.multires_use_attn if multires else use_attn,
                             'distances_normalized': args.use_dist_norm,
                             'binarize': binarize,
                             'lr': lr,
                             'hic_weight': hic_weight,
                             'n_neighbors': n_neighbors,
                             'lam_align': lam_align,
-                            'lam_graph': lam_graph})
+                            'lam_graph': lam_graph,
+                            'lam_cycle': lam_cycle,
+                            'lam_downsample': args.lam_downsample,
+                            'strata_weights': args.strata_weights,
+                            'strata_input_norm': not args.no_strata_input_norm,
+                            'depth_correction': depth_correction,
+                            'use_batch': use_batch,
+                            'seed': seed,
+                            'resolutions': resolutions if multires else [resolution],
+                            'multires_strata': multires_strata if multires else [n_strata],
+                            'multires_max_anchors': args.multires_max_anchors,
+                            'multires_use_dist': args.multires_use_dist,
+                            'multires_anchor_subsample': args.multires_anchor_subsample,
+                            'exp_name': exp_name})
 
         scglue.models.configure_dataset(rna, "NB", use_highly_variable=True, use_layer="counts", use_rep="X_pca" if use_rna_pca else None,
                                         use_cell_type=None, use_batch=use_batch, use_depth="depth" if depth_correction else None,
@@ -758,7 +771,7 @@ if __name__ == '__main__':
             celltype_map = {c: i for i, c in enumerate(celltypes)}
             hic.obs['old_celltype_int'] = hic.obs['old_celltype'].map(celltype_map)
             hic.obs['celltype_int'] = hic.obs['celltype'].map(celltype_map)
-            hic.obs['celltype_int'].fillna(len(celltypes), inplace=True)
+            hic.obs['celltype_int'] = hic.obs['celltype_int'].fillna(len(celltypes))
             # compute full accuracy
             accuracy = accuracy_score(hic.obs['old_celltype_int'], hic.obs['celltype_int'])
             ari = adjusted_rand_score(hic.obs['old_celltype_int'], hic.obs['celltype_int'])
@@ -797,7 +810,7 @@ if __name__ == '__main__':
                     atac.obs['old_celltype_int'] = atac.obs['old_celltype'].map(atac_celltype_map)
                     atac.obs['celltype_int'] = atac.obs['celltype'].map(atac_celltype_map)
                     # replace NaNs with the last index
-                    atac.obs['celltype_int'].fillna(len(atac_celltypes), inplace=True)
+                    atac.obs['celltype_int'] = atac.obs['celltype_int'].fillna(len(atac_celltypes))
                     atac_accuracy = accuracy_score(atac.obs['old_celltype_int'], atac.obs['celltype_int'])
                     atac_ari = adjusted_rand_score(atac.obs['old_celltype_int'], atac.obs['celltype_int'])
                     atac_ari_leiden = adjusted_rand_score(atac.obs['old_celltype_int'], atac.obs['leiden'])
@@ -818,7 +831,7 @@ if __name__ == '__main__':
                     methyl.obs['old_celltype_int'] = methyl.obs['old_celltype'].map(methyl_celltype_map)
                     methyl.obs['celltype_int'] = methyl.obs['celltype'].map(methyl_celltype_map)
                     # replace NaNs with the last index
-                    methyl.obs['celltype_int'].fillna(len(methyl_celltypes), inplace=True)
+                    methyl.obs['celltype_int'] = methyl.obs['celltype_int'].fillna(len(methyl_celltypes))
                     methyl_accuracy = accuracy_score(methyl.obs['old_celltype_int'], methyl.obs['celltype_int'])
                     methyl_ari = adjusted_rand_score(methyl.obs['old_celltype_int'], methyl.obs['celltype_int'])
                     methyl_ari_leiden = adjusted_rand_score(methyl.obs['old_celltype_int'], methyl.obs['leiden'])

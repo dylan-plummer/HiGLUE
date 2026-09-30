@@ -391,7 +391,7 @@ class SCGLUETrainer(GLUETrainer):
                 (1 - F.cosine_similarity(u[k].mean, u_down.mean, dim=1)).mean()
             )
         if not losses:
-            return torch.as_tensor(0.0, device=net.device)
+            return torch.zeros((), device=net.device)
         return sum(losses) / len(losses)
 
     @staticmethod
@@ -453,9 +453,7 @@ class SCGLUETrainer(GLUETrainer):
             for i, k in enumerate(keys)
         }
         xflag = {
-            k: torch.as_tensor(
-                i, dtype=torch.int64, device=device
-            ).expand(x[k].shape[0])
+            k: torch.full((x[k].shape[0], ), i, dtype=torch.int64, device=device)
             for i, k in enumerate(keys)
         }
         eidx = eidx.to(device, non_blocking=True)
@@ -498,7 +496,7 @@ class SCGLUETrainer(GLUETrainer):
         anneal = max(1 - (epoch - 1) / self.align_burnin, 0) \
             if self.align_burnin else 0
         if anneal:
-            noise = D.Normal(0, u_cat.std(axis=0)).sample((u_cat.shape[0], ))
+            noise = torch.randn_like(u_cat) * u_cat.std(axis=0).detach()  # N(0, std), no grad (like .sample())
             u_cat = u_cat + (anneal * self.BURNIN_NOISE_EXAG) * noise
         xflag_pred = net.du(u_cat, xbch_cat)
         dsc_loss = F.cross_entropy(xflag_pred, xflag_cat, reduction="none")
@@ -516,7 +514,7 @@ class SCGLUETrainer(GLUETrainer):
                 net.u2c(u_cat[lmsk]), xlbl_cat[lmsk], reduction="none"
             ).sum() / max(lmsk.sum(), 1)
         else:
-            sup_loss = torch.tensor(0.0, device=self.net.device)
+            sup_loss = torch.zeros((), device=self.net.device)
 
         if self.net.use_node_attributes:
             v = net.g2v(self.eidx, self.enorm, self.esgn, eattr)
@@ -526,12 +524,12 @@ class SCGLUETrainer(GLUETrainer):
 
         g_nll = -net.v2g(vsamp, eidx, esgn).log_prob(ewt)
         pos_mask = (ewt != 0).to(torch.int64)
-        n_pos = pos_mask.sum().item()
+        n_pos = pos_mask.sum()  # Kept on device to avoid a GPU sync
         n_neg = pos_mask.numel() - n_pos
         g_nll_pn = torch.zeros(2, dtype=g_nll.dtype, device=g_nll.device)
         g_nll_pn.scatter_add_(0, pos_mask, g_nll)
-        avgc = (n_pos > 0) + (n_neg > 0)
-        g_nll = (g_nll_pn[0] / max(n_neg, 1) + g_nll_pn[1] / max(n_pos, 1)) / avgc
+        avgc = (n_pos > 0).to(g_nll.dtype) + (n_neg > 0).to(g_nll.dtype)
+        g_nll = (g_nll_pn[0] / n_neg.clamp(min=1) + g_nll_pn[1] / n_pos.clamp(min=1)) / avgc
         g_kl = D.kl_divergence(v, prior).sum(dim=1).mean() / vsamp.shape[0]
         g_elbo = g_nll + self.lam_kl * g_kl
 
@@ -557,7 +555,7 @@ class SCGLUETrainer(GLUETrainer):
         x_elbo_sum = sum(self.modality_weight[k] * x_elbo[k] for k in net.keys)
 
         downsample_loss = self.downsample_consistency(x, xrep, u) \
-            if self.lam_downsample else torch.as_tensor(0.0, device=net.device)
+            if self.lam_downsample else torch.zeros((), device=net.device)
 
         vae_loss = self.lam_data * x_elbo_sum \
             + self.lam_graph * len(net.keys) * g_elbo \
@@ -763,9 +761,7 @@ class PairedSCGLUETrainer(SCGLUETrainer):
             for i, k in enumerate(keys)
         }
         xflag = {
-            k: torch.as_tensor(
-                i, dtype=torch.int64, device=device
-            ).expand(x[k].shape[0])
+            k: torch.full((x[k].shape[0], ), i, dtype=torch.int64, device=device)
             for i, k in enumerate(keys)
         }
         pmsk = pmsk.to(device, non_blocking=True)
@@ -802,7 +798,7 @@ class PairedSCGLUETrainer(SCGLUETrainer):
         anneal = max(1 - (epoch - 1) / self.align_burnin, 0) \
             if self.align_burnin else 0
         if anneal:
-            noise = D.Normal(0, u_cat.std(axis=0)).sample((u_cat.shape[0], ))
+            noise = torch.randn_like(u_cat) * u_cat.std(axis=0).detach()  # N(0, std), no grad (like .sample())
             u_cat = u_cat + (anneal * self.BURNIN_NOISE_EXAG) * noise
         dsc_loss = F.cross_entropy(net.du(u_cat, xbch_cat), xflag_cat, reduction="none")
         dsc_loss = (dsc_loss * xdwt_cat).sum() / xdwt_cat.numel()
@@ -822,16 +818,16 @@ class PairedSCGLUETrainer(SCGLUETrainer):
                 net.u2c(u_cat[lmsk]), xlbl_cat[lmsk], reduction="none"
             ).sum() / max(lmsk.sum(), 1)
         else:
-            sup_loss = torch.tensor(0.0, device=self.net.device)
+            sup_loss = torch.zeros((), device=self.net.device)
 
         g_nll = -net.v2g(vsamp, eidx, esgn).log_prob(ewt)
         pos_mask = (ewt != 0).to(torch.int64)
-        n_pos = pos_mask.sum().item()
+        n_pos = pos_mask.sum()  # Kept on device to avoid a GPU sync
         n_neg = pos_mask.numel() - n_pos
         g_nll_pn = torch.zeros(2, dtype=g_nll.dtype, device=g_nll.device)
         g_nll_pn.scatter_add_(0, pos_mask, g_nll)
-        avgc = (n_pos > 0) + (n_neg > 0)
-        g_nll = (g_nll_pn[0] / max(n_neg, 1) + g_nll_pn[1] / max(n_pos, 1)) / avgc
+        avgc = (n_pos > 0).to(g_nll.dtype) + (n_neg > 0).to(g_nll.dtype)
+        g_nll = (g_nll_pn[0] / n_neg.clamp(min=1) + g_nll_pn[1] / n_pos.clamp(min=1)) / avgc
         g_kl = D.kl_divergence(v, prior).sum(dim=1).mean() / vsamp.shape[0]
         g_elbo = g_nll + self.lam_kl * g_kl
         subsets = self.feature_subsets()
@@ -876,12 +872,12 @@ class PairedSCGLUETrainer(SCGLUETrainer):
                 for k, nll in x_joint_cross_nll.items()
             )
         else:
-            joint_cross_loss = torch.as_tensor(0.0, device=net.device)
+            joint_cross_loss = torch.zeros((), device=net.device)
 
         if self.lam_real_cross:
             x_real_cross_nll = {}
             for k_tgt, m_tgt in zip(net.keys, pmsk):
-                x_tgt_real_cross_nll = torch.as_tensor(0.0, device=net.device)
+                x_tgt_real_cross_nll = torch.zeros((), device=net.device)
                 for k_src, m_src in zip(net.keys, pmsk):
                     if k_src == k_tgt:
                         continue
@@ -900,7 +896,7 @@ class PairedSCGLUETrainer(SCGLUETrainer):
                 for k, nll in x_real_cross_nll.items()
             )
         else:
-            real_cross_loss = torch.as_tensor(0.0, device=net.device)
+            real_cross_loss = torch.zeros((), device=net.device)
 
         if self.lam_cos:
             cos_loss = sum(
@@ -910,10 +906,10 @@ class PairedSCGLUETrainer(SCGLUETrainer):
                 for i, m in enumerate(pmsk) if m.sum()
             )
         else:
-            cos_loss = torch.as_tensor(0.0, device=net.device)
+            cos_loss = torch.zeros((), device=net.device)
 
         downsample_loss = self.downsample_consistency(x, xrep, u) \
-            if self.lam_downsample else torch.as_tensor(0.0, device=net.device)
+            if self.lam_downsample else torch.zeros((), device=net.device)
 
         vae_loss = self.lam_data * x_elbo_sum \
             + self.lam_graph * len(net.keys) * g_elbo \

@@ -735,11 +735,13 @@ class StrataScaler(torch.nn.Module):
             return
         with torch.no_grad():
             scale = scale.clamp(min=self.eps).to(self.running_scale.dtype)
-            if bool(self.initialized):
-                self.running_scale.mul_(1 - self.momentum).add_(self.momentum * scale)
-            else:
-                self.running_scale.copy_(scale)
-                self.initialized.fill_(True)
+            # Blend on device instead of branching on `initialized`, which would
+            # synchronize with the GPU on every forward pass
+            momentum = torch.where(
+                self.initialized, self.momentum, 1.0
+            ).to(self.running_scale.dtype)
+            self.running_scale.mul_(1 - momentum).add_(momentum * scale)
+            self.initialized.fill_(True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         r"""
@@ -938,6 +940,76 @@ class ZINBDataDecoder(NBDataDecoder):
 
 
 #--------------------- Multi-resolution Hi-C network modules --------------------
+
+def contiguous_segments(
+        segment: torch.Tensor, n_segments: int
+) -> Optional[List[Tuple[int, int]]]:
+    r"""
+    Column range of every segment, if each segment is one contiguous block
+
+    Parameters
+    ----------
+    segment
+        Segment id of every column
+    n_segments
+        Number of segments
+
+    Returns
+    -------
+    bounds
+        ``(start, stop)`` of every segment, or ``None`` if some segment is
+        empty or not contiguous
+    """
+    segment = segment.detach().cpu().numpy()
+    bounds = []
+    for i in range(n_segments):
+        idx = np.flatnonzero(segment == i)
+        if not idx.size or idx[-1] - idx[0] + 1 != idx.size:
+            return None
+        bounds.append((int(idx[0]), int(idx[-1]) + 1))
+    return bounds
+
+
+def segment_sum(
+        x: torch.Tensor, segment: torch.Tensor, n_segments: int,
+        bounds: Optional[List[Tuple[int, int]]] = None
+) -> torch.Tensor:
+    r"""
+    Sum the columns of ``x`` (:math:`n_{cells} \times n_{columns}`) by segment
+
+    With contiguous segments this is a handful of slice reductions. The
+    general ``index_add_`` fallback funnels every entry of ``x`` into a few
+    output columns with atomics, which is very slow on the GPU for wide ``x``.
+    """
+    if bounds is not None:
+        return torch.stack([x[:, a:b].sum(dim=1) for a, b in bounds], dim=1)
+    return torch.zeros(
+        x.shape[0], n_segments, dtype=x.dtype, device=x.device
+    ).index_add_(1, segment, x)
+
+
+def stratum_key_bytes(spec: "ResolutionSpec", window: int, dim: int) -> int:
+    r"""
+    Rough size of the activations the stratum keys of a resolution keep for
+    the backward pass: attention scores and weights over ~3 windows per anchor,
+    plus about a dozen ``dim``-wide intermediates (convolution, norms,
+    projections, feed-forward)
+    """
+    return 4 * max(spec.n_strata - 1, 0) * spec.n_anchors * (6 * window + 12 * dim)
+
+
+def batch_rows(param: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    r"""
+    Per-cell rows of a per-batch parameter table, i.e. ``param[b]``
+
+    The backward of advanced indexing is a sort-based scatter, which dominated
+    the decoder. With a single batch the rows are just broadcast, otherwise
+    ``index_select`` is used, whose backward is a plain ``index_add_``.
+    """
+    if param.shape[0] == 1:
+        return param.expand(b.shape[0], *param.shape[1:])
+    return param.index_select(0, b)
+
 
 class ResolutionSpec:
 
@@ -1211,9 +1283,9 @@ class MultiResHiCDataEncoder(DataEncoder):
         r"""
         Per-resolution library size (:math:`n_{cells} \times n_{res}`)
         """
-        l = torch.zeros(
-            x.shape[0], self.n_res, dtype=x.dtype, device=x.device
-        ).index_add_(1, self.res_of_feature, x)
+        if not hasattr(self, "_res_bounds"):  # also covers models saved earlier
+            self._res_bounds = contiguous_segments(self.res_of_feature, self.n_res)
+        l = segment_sum(x, self.res_of_feature, self.n_res, self._res_bounds)
         return l.clamp(min=1.0)
 
     def normalize(self, x: torch.Tensor, l: torch.Tensor) -> torch.Tensor:
@@ -1301,11 +1373,17 @@ class FeatureSubset:
 
     def __init__(
             self, cols: torch.Tensor, res_of_col: torch.Tensor,
-            anchors: List[torch.Tensor]
+            anchors: List[torch.Tensor],
+            res_sizes: Optional[List[int]] = None
     ) -> None:
         self.cols = cols
         self.res_of_col = res_of_col
         self.anchors = anchors
+        # columns are grouped by resolution, so known sizes give the bounds
+        self.res_bounds = None
+        if res_sizes is not None:
+            stops = np.cumsum(res_sizes).tolist()
+            self.res_bounds = list(zip([0] + stops[:-1], stops))
 
     def index_data(self, x: torch.Tensor) -> torch.Tensor:
         r"""
@@ -1317,9 +1395,9 @@ class FeatureSubset:
         r"""
         Per-resolution library size of the subset
         """
-        return torch.zeros(
-            x_sub.shape[0], n_res, dtype=x_sub.dtype, device=x_sub.device
-        ).index_add_(1, self.res_of_col, x_sub).clamp(min=1.0)
+        return segment_sum(
+            x_sub, self.res_of_col, n_res, self.res_bounds
+        ).clamp(min=1.0)
 
 
 class MultiResStratifiedZINBDataDecoder(DataDecoder):
@@ -1368,7 +1446,13 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
         Resolutions with more anchors than this recompute their attention keys
         during the backward pass even when ``checkpoint`` is off. The keys do
         not depend on the minibatch, so recomputing them is cheap relative to
-        the activations local attention would otherwise keep.
+        the activations local attention would otherwise keep. By default
+        (``None``), a resolution is recomputed when the estimated size of
+        those activations exceeds ``key_checkpoint_max_bytes``.
+    key_checkpoint_max_bytes
+        Activation budget of the stratum keys of one resolution above which
+        they are recomputed during the backward pass. Resolutions below it
+        compute the attention of all strata in a single batched call.
     """
 
     def __init__(
@@ -1381,7 +1465,8 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
             cell_strata_weights: bool = True,
             attn_window: Optional[int] = None,
             checkpoint: bool = False,
-            key_checkpoint_min_anchors: int = 4096
+            key_checkpoint_min_anchors: Optional[int] = None,
+            key_checkpoint_max_bytes: float = 2 ** 30
     ) -> None:
         super().__init__(out_features, n_batches=n_batches)
         if not res_specs:
@@ -1474,8 +1559,11 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
         # Attention over a long anchor sequence is the memory-dominant part of
         # the decoder, so trade it for compute where the sequence is long
         self.auto_checkpoint = [
-            use_attn and spec.n_anchors > key_checkpoint_min_anchors
-            for spec in res_specs
+            use_attn and (
+                spec.n_anchors > key_checkpoint_min_anchors
+                if key_checkpoint_min_anchors is not None
+                else stratum_key_bytes(spec, window, embedding_size) > key_checkpoint_max_bytes
+            ) for spec, window in zip(res_specs, attn_windows or [0] * len(res_specs))
         ]
         if use_attn:
             self.attn_layers_by_res = torch.nn.ModuleList(attn_layers)
@@ -1545,6 +1633,11 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
             res_of_col.append(torch.full((band.numel(), ), i, dtype=torch.int64, device=device))
         cols = torch.cat(cols)
         res_of_col = torch.cat(res_of_col)
+        if all(self.band_complete):  # no padding to drop, avoid a GPU sync
+            return FeatureSubset(
+                cols, res_of_col, anchors,
+                res_sizes=[spec.n_strata * a.numel() for spec, a in zip(self.res_specs, anchors)]
+            )
         keep = cols >= 0  # drop structural padding
         return FeatureSubset(cols[keep], res_of_col[keep], anchors)
 
@@ -1591,6 +1684,46 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
             )
         return key
 
+    def all_stratum_keys(self, res_i: int, v: torch.Tensor) -> List[torch.Tensor]:
+        r"""
+        Feature latents of all strata of a resolution, same as calling
+        :meth:`stratum_keys` for every stratum
+
+        The strata are independent of each other and their local attention
+        modules are parameter-free and identically configured, so attention
+        runs once over all strata stacked along the batch dimension instead of
+        once per stratum. That cuts hundreds of small kernel launches per step.
+        """
+        n_strata = self.res_specs[res_i].n_strata
+        keys = [
+            stratum_key_conv(self.key_convs_by_res[res_i][k - 1], v, k)
+            for k in range(1, n_strata)
+        ]
+        if self.use_activation:
+            keys = [
+                self.key_conv_activations_by_res[res_i][k - 1](key)
+                for k, key in enumerate(keys, start=1)
+            ]
+        if self.use_attn and keys:
+            prenorm = [
+                self.prenorm_layers_by_res[res_i][k - 1](key)
+                for k, key in enumerate(keys, start=1)
+            ]
+            qk = torch.stack([
+                self.qk_layers_by_res[res_i][k - 1](item)
+                for k, item in enumerate(prenorm, start=1)
+            ])
+            attn = self.attn_layers_by_res[res_i][0](qk, qk, torch.stack(prenorm))
+            keys = [key + attn[k - 1] for k, key in enumerate(keys, start=1)]
+            keys = [
+                key + self.ff_activation(
+                    self.ff_layers_by_res[res_i][k - 1](
+                        self.postnorm_layers_by_res[res_i][k - 1](key)
+                    )
+                ) for k, key in enumerate(keys, start=1)
+            ]
+        return [v] + keys
+
     def _stratum_keys(self, res_i: int, v: torch.Tensor, k: int) -> torch.Tensor:
         if self.training and (self.checkpoint or self.auto_checkpoint[res_i]):
             return torch.utils.checkpoint.checkpoint(
@@ -1613,17 +1746,17 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
 
         if subset is None:
             cols = None
-            scale = F.softplus(self.scale_lin[b])
-            bias = self.bias[b]
-            log_theta = self.log_theta[b]
+            scale = F.softplus(batch_rows(self.scale_lin, b))
+            bias = batch_rows(self.bias, b)
+            log_theta = batch_rows(self.log_theta, b)
             mu = torch.zeros(
                 n_cells, self.scale_lin.shape[1], device=u.device, dtype=u.dtype
             )
         else:
             cols = subset.cols
-            scale = F.softplus(self.scale_lin.index_select(1, cols))[b]
-            bias = self.bias.index_select(1, cols)[b]
-            log_theta = self.log_theta.index_select(1, cols)[b]
+            scale = batch_rows(F.softplus(self.scale_lin.index_select(1, cols)), b)
+            bias = batch_rows(self.bias.index_select(1, cols), b)
+            log_theta = batch_rows(self.log_theta.index_select(1, cols), b)
             mu_slices = []
 
         col_ptr = 0
@@ -1632,8 +1765,12 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
             weights = self.stratum_weights(i, u)  # n_cells * n_strata
             band_idx = getattr(self, f"band_idx_{i}")
             anchor_idx = None if subset is None else subset.anchors[i]
+            # checkpointed resolutions keep computing one stratum at a time
+            # so that only one stratum's activations are alive at once
+            per_stratum = self.training and (self.checkpoint or self.auto_checkpoint[i])
+            all_keys = None if per_stratum else self.all_stratum_keys(i, v_res)
             for k in range(spec.n_strata):
-                key = self._stratum_keys(i, v_res, k)
+                key = self._stratum_keys(i, v_res, k) if per_stratum else all_keys[k]
                 if anchor_idx is not None:
                     key = key.index_select(0, anchor_idx)
                     positions = band_idx[k].index_select(0, anchor_idx)
@@ -1666,8 +1803,8 @@ class MultiResStratifiedZINBDataDecoder(DataDecoder):
 
         if self.binarize:
             return D.Bernoulli(logits=mu)
-        zi_logits = self.zi_logits[b] if cols is None \
-            else self.zi_logits.index_select(1, cols)[b]
+        zi_logits = batch_rows(self.zi_logits, b) if cols is None \
+            else batch_rows(self.zi_logits.index_select(1, cols), b)
         return ZINB(
             zi_logits.expand_as(mu),
             log_theta.exp(),
