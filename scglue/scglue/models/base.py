@@ -10,6 +10,7 @@ from typing import Any, Iterable, List, Mapping, Optional
 
 import dill
 import ignite
+import numpy as np
 import torch
 
 from ..utils import DelayedKeyboardInterrupt, config, logged
@@ -151,7 +152,20 @@ class Trainer:
         train_engine.add_event_handler(COMPLETED, delay_interrupt)
 
         # Exception handling
-        train_engine.add_event_handler(ITERATION_COMPLETED, ignite.handlers.TerminateOnNan())
+        # Non-finite losses are detected from the epoch averages (a NaN in any
+        # iteration propagates into them) rather than after every iteration,
+        # which would copy every loss back from the GPU each step
+        def _terminate_on_nan(engine):
+            bad = [
+                key for key, val in engine.state.metrics.items()
+                if not np.isfinite(float(val))
+            ]
+            if bad:
+                self.logger.warning(
+                    "Non-finite loss %s in epoch %d, stopping training",
+                    bad, engine.state.epoch
+                )
+                engine.terminate()
 
         @train_engine.on(EXCEPTION_RAISED)
         def _handle_exception(engine, e):
@@ -161,15 +175,22 @@ class Trainer:
             else:
                 raise e
 
-        # Compute metrics
+        # Compute metrics (accumulated on the model device so that losses are
+        # not copied back from the GPU every iteration)
+        metric_device = next(self.net.parameters()).device
         for item in self.required_losses:
             ignite.metrics.Average(
-                output_transform=lambda output, item=item: output[item]
+                output_transform=lambda output, item=item: output[item],
+                device=metric_device
             ).attach(train_engine, item)
             if val_engine:
                 ignite.metrics.Average(
-                    output_transform=lambda output, item=item: output[item]
+                    output_transform=lambda output, item=item: output[item],
+                    device=metric_device
                 ).attach(val_engine, item)
+
+        # Registered after the metrics so that it sees this epoch's averages
+        train_engine.add_event_handler(EPOCH_COMPLETED, _terminate_on_nan)
 
         if val_engine:
             @train_engine.on(EPOCH_COMPLETED)
@@ -215,9 +236,11 @@ class Trainer:
             Dict containing loss values
         """
         engine = ignite.engine.Engine(self.val_step)
+        metric_device = next(self.net.parameters()).device
         for item in self.required_losses:
             ignite.metrics.Average(
-                output_transform=lambda output, item=item: output[item]
+                output_transform=lambda output, item=item: output[item],
+                device=metric_device
             ).attach(engine, item)
         engine.run(loader, max_epochs=1)
         torch.cuda.empty_cache()  # Works even if GPU is unavailable

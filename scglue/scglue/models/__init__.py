@@ -10,6 +10,7 @@ import dill
 import networkx as nx
 import numpy as np
 import pandas as pd
+import torch
 from anndata import AnnData
 
 from ..data import estimate_balancing_weight
@@ -22,8 +23,107 @@ from .scclue import SCCLUEModel
 from .scglue import PairedSCGLUEModel, SCGLUEModel
 from .plugins import EmbeddingVisualizer
 
+# Argument validation of torch distributions checks tensor values on the host,
+# i.e. synchronizes with the GPU every time a distribution is constructed or
+# evaluated, which happens many times per training step
+torch.distributions.Distribution.set_default_validate_args(False)
+
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def build_multires_config(
+        adata: AnnData, features: list,
+        res_key: str = "res", stratum_key: str = "stratum",
+        anchor_key: str = "anchor",
+        res_order: Optional[list] = None
+) -> Mapping:
+    r"""
+    Summarize the multi-resolution layout of a Hi-C modality
+
+    Parameters
+    ----------
+    adata
+        Multi-resolution Hi-C dataset. ``adata.var`` must contain the
+        resolution, stratum and anchor of every feature.
+    features
+        Features used by the model, in order
+    res_key
+        ``adata.var`` column holding the resolution of each feature
+    stratum_key
+        ``adata.var`` column holding the diagonal stratum of each feature
+    anchor_key
+        ``adata.var`` column holding the name of the anchor (i.e. the
+        stratum 0 feature) each feature belongs to
+    res_order
+        Resolution order (coarse to fine), by default the order of first
+        appearance in ``adata.var``
+
+    Returns
+    -------
+    multires
+        Multi-resolution configuration
+    """
+    for key in (res_key, stratum_key, anchor_key):
+        if key not in adata.var:
+            raise ValueError(
+                f"Multi-resolution data requires a '{key}' column in `adata.var`!"
+            )
+    if not adata.var_names.is_unique:
+        duplicated = adata.var_names[adata.var_names.duplicated()].unique()
+        raise ValueError(
+            f"Multi-resolution features must have unique names, but "
+            f"{duplicated.size} are duplicated (e.g. {list(duplicated[:3])}). "
+            f"Rerun preprocessing to rebuild the dataset."
+        )
+    columns = [res_key, stratum_key, anchor_key]
+    if len(features) == adata.n_vars and np.array_equal(
+        np.asarray(features), adata.var_names.to_numpy()
+    ):  # avoid a label lookup over millions of features
+        var = adata.var[columns]
+    else:
+        var = adata.var.loc[features, columns]
+    feature_res = var[res_key].astype(str).to_numpy()
+    feature_stratum = var[stratum_key].to_numpy().astype(np.int64)
+    feature_anchor = var[anchor_key].astype(str).to_numpy()
+    if res_order is None:
+        res_order = list(pd.unique(feature_res))
+    else:
+        res_order = [str(item) for item in res_order]
+        missing = set(feature_res).difference(res_order)
+        if missing:
+            raise ValueError(f"Resolutions {sorted(missing)} missing from `res_order`!")
+
+    feature_res_code = np.full(len(features), -1, dtype=np.int64)
+    feature_anchor_pos = np.zeros(len(features), dtype=np.int64)
+    anchors, n_strata = {}, []
+    features_index = pd.Index(features)
+    for i, res in enumerate(res_order):
+        mask = feature_res == res
+        if not mask.any():
+            raise ValueError(f"Resolution '{res}' has no features!")
+        feature_res_code[mask] = i
+        res_anchors = features_index[mask & (feature_stratum == 0)]
+        if not res_anchors.size:
+            raise ValueError(f"Resolution '{res}' has no stratum 0 features!")
+        pos = res_anchors.get_indexer(feature_anchor[mask])
+        if pos.min() < 0:
+            orphan = feature_anchor[mask][pos < 0]
+            raise ValueError(
+                f"Resolution '{res}' has {orphan.size} features whose anchor is "
+                f"not itself a feature (e.g. {orphan[:5].tolist()})!"
+            )
+        feature_anchor_pos[mask] = pos
+        anchors[res] = res_anchors.to_numpy().tolist()
+        n_strata.append(int(feature_stratum[mask].max()) + 1)
+    return {
+        "res_order": res_order,
+        "n_strata": n_strata,
+        "anchors": anchors,
+        "feature_res_code": feature_res_code,
+        "feature_stratum": feature_stratum,
+        "feature_anchor_pos": feature_anchor_pos
+    }
+
 
 @logged
 def configure_dataset(
@@ -35,7 +135,10 @@ def configure_dataset(
         use_depth: Optional[str] = None,
         use_cell_type: Optional[str] = None,
         use_dsc_weight: Optional[str] = None,
-        use_obs_names: bool = False
+        use_obs_names: bool = False,
+        use_multires: bool = False,
+        multires_res_order: Optional[list] = None,
+        binarize: bool = False
 ) -> None:
     r"""
     Configure dataset for model training
@@ -63,6 +166,15 @@ def configure_dataset(
     use_obs_names
         Whether to use ``obs_names`` to mark paired cells across
         different datasets
+    use_multires
+        Whether the dataset holds features at multiple resolutions
+        (requires ``res``, ``stratum`` and ``anchor`` columns in ``adata.var``)
+    multires_res_order
+        Resolution order (coarse to fine), only used with ``use_multires``
+    binarize
+        Whether to binarize the data when fetching minibatches. This is applied
+        on the fly, which keeps the original counts on disk untouched and works
+        with backed datasets.
 
     Note
     -----
@@ -132,6 +244,11 @@ def configure_dataset(
     else:
         data_config["use_dsc_weight"] = None
     data_config["use_obs_names"] = use_obs_names
+    data_config["binarize"] = binarize
+    if use_multires:
+        data_config["multires"] = build_multires_config(
+            adata, data_config["features"], res_order=multires_res_order
+        )
     adata.uns[config.ANNDATA_KEY] = data_config
 
 
@@ -162,7 +279,7 @@ def fit_SCGLUE(
         adatas: Mapping[str, AnnData], graph: nx.Graph, model: type = SCGLUEModel,
         skip_balance: bool = False,
         init_kws: Kws = None, compile_kws: Kws = None, fit_kws: Kws = None,
-        balance_kws: Kws = None, log_wandb: bool = False
+        balance_kws: Kws = None, log_wandb: bool = False, viz_kws: Kws = None
 ) -> SCGLUEModel:
     r"""
     Fit GLUE model to integrate single-cell multi-omics data
@@ -193,6 +310,10 @@ def fit_SCGLUE(
     balance_kws
         Balancing weight estimation keyword arguments
         (see :func:`scglue.data.estimate_balancing_weight`)
+    viz_kws
+        Training visualization keyword arguments (see
+        :class:`scglue.models.plugins.EmbeddingVisualizer`, e.g. ``genes``,
+        ``n_loci``, ``level``); figures go to ``<directory>/viz/<stage>``
 
     Returns
     -------
@@ -203,6 +324,8 @@ def fit_SCGLUE(
     compile_kws = compile_kws or {}
     fit_kws = fit_kws or {}
     balance_kws = balance_kws or {}
+    viz_kws = viz_kws or {}
+    viz_root = os.path.join(fit_kws.get("directory", "glue"), "viz")
 
     fit_SCGLUE.logger.info("Pretraining SCGLUE model...")
     pretrain_init_kws = init_kws.copy()
@@ -240,7 +363,9 @@ def fit_SCGLUE(
                                         methyl=adatas.get('methyl', None), methyl_data_config=pretrain.modalities.get('methyl', None),
                                         latent_dim=init_kws['latent_dim'],
                                         prefix='pretrain',
-                                        save_interval=fit_kws.get('save_interval', 10))
+                                        out_dir=os.path.join(viz_root, 'pretrain'),
+                                        save_interval=fit_kws.get('save_interval', 10),
+                                        **viz_kws)
     pretrain.fit(adatas, graph, **pretrain_fit_kws, plugins=[embedding_viz])
     if "directory" in pretrain_fit_kws:
         pretrain.save(os.path.join(pretrain_fit_kws["directory"], "pretrain.dill"))
@@ -288,7 +413,9 @@ def fit_SCGLUE(
                                         methyl=adatas.get('methyl', None), methyl_data_config=pretrain.modalities.get('methyl', None),
                                         latent_dim=init_kws['latent_dim'],
                                         prefix='finetune',
-                                        save_interval=fit_kws.get('save_interval', 10))
+                                        out_dir=os.path.join(viz_root, 'finetune'),
+                                        save_interval=fit_kws.get('save_interval', 10),
+                                        **viz_kws)
     finetune.fit(adatas, graph, **finetune_fit_kws, plugins=[embedding_viz])
     if "directory" in finetune_fit_kws:
         finetune.save(os.path.join(finetune_fit_kws["directory"], "fine-tune.dill"))

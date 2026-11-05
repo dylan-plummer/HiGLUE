@@ -107,13 +107,23 @@ class GraphAttent(torch.nn.Module):  # pragma: no cover
         result
             Graph attention result (:math:`n_{vertices} \times n_{features}`)
         """
+        # The same full graph is passed in every step, so the edges of each
+        # sign are located once (boolean masking would synchronize with the
+        # GPU every call)
+        cache = getattr(self, "_sign_split", None)
+        if cache is None or cache[0] is not eidx or cache[1] is not esgn:
+            cache = (eidx, esgn, {
+                "pos": (esgn == 1).nonzero().squeeze(1),
+                "neg": (esgn == -1).nonzero().squeeze(1)
+            })
+            self._sign_split = cache
         res_dict = {}
         for sgn in ("pos", "neg"):
-            mask = esgn == 1 if sgn == "pos" else esgn == -1
-            sidx, tidx = eidx[:, mask]
+            sel = cache[2][sgn]
+            sidx, tidx = eidx.index_select(1, sel)
             ptr = input @ self.weight[sgn].T
             alpha = torch.cat([ptr[sidx], ptr[tidx]], dim=1) @ self.head[sgn]
-            alpha = F.leaky_relu(alpha, negative_slope=0.2).exp() * ewt[mask]
+            alpha = F.leaky_relu(alpha, negative_slope=0.2).exp() * ewt.index_select(0, sel)
             normalizer = torch.zeros(ptr.shape[0], device=ptr.device)
             normalizer.scatter_add_(0, tidx, alpha)
             alpha = alpha / normalizer[tidx]  # Only entries with non-zero denominators will be used

@@ -4,6 +4,7 @@ Generic framework of graph-linked unified embedding (GLUE)
 
 import itertools
 import os
+from math import ceil
 from abc import abstractmethod
 from typing import Any, List, Mapping, NoReturn, Optional, Tuple
 
@@ -287,6 +288,11 @@ class GLUETrainer(Trainer):
         Additional keyword arguments are passed to the optimizer constructor
     """
 
+    #: Training data are kept on the GPU (and minibatches gathered there) when
+    #: their dense size is below both of these limits
+    DATA_DEVICE_MAX_BYTES: float = 4 * 2 ** 30
+    DATA_DEVICE_MAX_FREE_FRACTION: float = 0.3
+
     def __init__(
             self, net: GLUE, lam_data: float = None, lam_kl: float = None,
             lam_graph: float = None, lam_align: float = None,
@@ -557,7 +563,28 @@ class GLUETrainer(Trainer):
 
         data.getitem_size = max(1, round(data_batch_size / config.DATALOADER_FETCHES_PER_BATCH))
         graph.getitem_size = max(1, round(graph_batch_size / config.DATALOADER_FETCHES_PER_BATCH))
+        data_on_device = False
+        device = self.net.device
+        # (not with worker processes, which cannot use the parent's CUDA tensors)
+        if not config.CPU_ONLY and device.type == "cuda" and hasattr(data, "to_device") \
+                and not config.DATALOADER_NUM_WORKERS:
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+            data_on_device = data.to_device(device, min(
+                self.DATA_DEVICE_MAX_BYTES,
+                self.DATA_DEVICE_MAX_FREE_FRACTION * free_bytes
+            ))
+        pin_memory = config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY
+        pin_data = pin_memory and not data_on_device  # Device tensors cannot be pinned
         data_train, data_val = data.random_split([1 - val_split, val_split], random_state=random_seed)
+        # The graph is resampled at the start of every train and validation
+        # pass, but each pass only consumes one graph batch per data batch
+        graph_batches = max(
+            ceil(len(data_train) / config.DATALOADER_FETCHES_PER_BATCH),
+            ceil(len(data_val) / config.DATALOADER_FETCHES_PER_BATCH)
+        )
+        graph.limit_epoch(
+            graph_batches * config.DATALOADER_FETCHES_PER_BATCH * graph.getitem_size
+        )
         data_train.prepare_shuffle(num_workers=config.ARRAY_SHUFFLE_NUM_WORKERS, random_seed=random_seed)
         data_val.prepare_shuffle(num_workers=config.ARRAY_SHUFFLE_NUM_WORKERS, random_seed=random_seed)
         graph.prepare_shuffle(num_workers=config.GRAPH_SHUFFLE_NUM_WORKERS, random_seed=random_seed)
@@ -566,7 +593,7 @@ class GLUETrainer(Trainer):
             DataLoader(
                 data_train, batch_size=config.DATALOADER_FETCHES_PER_BATCH, shuffle=True,
                 num_workers=config.DATALOADER_NUM_WORKERS,
-                pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY,
+                pin_memory=pin_data,
                 drop_last=len(data_train) > config.DATALOADER_FETCHES_PER_BATCH,
                 generator=torch.Generator().manual_seed(random_seed),
                 persistent_workers=False
@@ -574,7 +601,7 @@ class GLUETrainer(Trainer):
             DataLoader(
                 graph, batch_size=config.DATALOADER_FETCHES_PER_BATCH, shuffle=True,
                 num_workers=config.DATALOADER_NUM_WORKERS,
-                pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY,
+                pin_memory=pin_memory,
                 drop_last=len(graph) > config.DATALOADER_FETCHES_PER_BATCH,
                 generator=torch.Generator().manual_seed(random_seed),
                 persistent_workers=False
@@ -585,14 +612,14 @@ class GLUETrainer(Trainer):
             DataLoader(
                 data_val, batch_size=config.DATALOADER_FETCHES_PER_BATCH, shuffle=True,
                 num_workers=config.DATALOADER_NUM_WORKERS,
-                pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY, drop_last=False,
+                pin_memory=pin_data, drop_last=False,
                 generator=torch.Generator().manual_seed(random_seed),
                 persistent_workers=False
             ),
             DataLoader(
                 graph, batch_size=config.DATALOADER_FETCHES_PER_BATCH, shuffle=True,
                 num_workers=config.DATALOADER_NUM_WORKERS,
-                pin_memory=config.DATALOADER_PIN_MEMORY and not config.CPU_ONLY, drop_last=False,
+                pin_memory=pin_memory, drop_last=False,
                 generator=torch.Generator().manual_seed(random_seed),
                 persistent_workers=False
             ),
