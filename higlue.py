@@ -12,12 +12,12 @@ import matplotlib.pyplot as plt
 import torch
 
 from matplotlib.colors import Normalize
-from scipy.stats import pearsonr
-from sklearn.metrics import accuracy_score, adjusted_rand_score, silhouette_score
 from preprocess_data import (
     preprocess_higlue, preprocess_higlue_multires, multires_extra_suffix
 )
 import multires_hic as mh
+import evals
+import structure_eval
 
 
 def _sanitize_plot_name(name):
@@ -158,6 +158,11 @@ if __name__ == '__main__':
     glue_parser.add_argument('--n_strata', type=int, default=10)
     glue_parser.add_argument('--use_ice', action='store_true')
     glue_parser.add_argument('--use_dist_norm', action='store_true')
+    glue_parser.add_argument(
+        '--gene_edges', choices=['body', 'promoter'], default='body',
+        help='link each gene to the Hi-C bins overlapping its body (and 2kb upstream; the '
+             'original HiGLUE) or only to the bin at its promoter'
+    )
     glue_parser.add_argument('--viz_rna', action='store_true')
     glue_parser.add_argument('--load_rna', action='store_true')
     glue_parser.add_argument('--preprocess', action='store_true')
@@ -171,6 +176,17 @@ if __name__ == '__main__':
     glue_parser.add_argument('--n_genes', type=int, default=10000)
     glue_parser.add_argument('--n_atac_peaks', type=int, default=None)
     glue_parser.add_argument('--gene_list', nargs='+', default=None)
+    glue_parser.add_argument(
+        '--match_composition', action='store_true',
+        help='diagnostic oracle: downsample the RNA reference to the cell type '
+             'proportions of the Hi-C query (uses the Hi-C labels)'
+    )
+    glue_parser.add_argument(
+        '--celltypes', nargs='+', default=None,
+        help='train and evaluate on cells of these types only, in every modality. '
+             'Query (Hi-C) names also select the matching RNA subtypes through '
+             'the dataset label map in evals.py (e.g. "Epi Aci" keeps RNA Acinar)'
+    )
     glue_parser.add_argument('--no_depth_correction', action='store_true')
     glue_parser.add_argument('--use_trans', action='store_true')
     glue_parser.add_argument('--bulk_hic', type=str, default=None)
@@ -200,7 +216,7 @@ if __name__ == '__main__':
     glue_parser.add_argument('--lam_cycle', type=float, default=0.02)
     glue_parser.add_argument('--suffix', type=str, default='2d')
     glue_parser.add_argument('--exp_name', type=str, default=None)
-    glue_parser.add_argument('--save_interval', type=int, default=100)
+    glue_parser.add_argument('--save_interval', type=int, default=10)
     glue_parser.add_argument('--latent_dim', type=int, default=64)
     glue_parser.add_argument('--batch_size', type=int, default=128)
     glue_parser.add_argument('--h_dim', type=int, default=128)
@@ -211,12 +227,68 @@ if __name__ == '__main__':
     glue_parser.add_argument('--max_epochs', type=int, default=None)
     glue_parser.add_argument('--wandb', action='store_true')
     glue_parser.add_argument('--balance', action='store_true')
+    glue_parser.add_argument(
+        '--comp_weight', choices=['auto', 'none', 'graph'], default='auto',
+        help="weights of the RNA cells in the modality discriminator: 'graph' estimates the "
+             "Hi-C cell type composition without the adversary (Hi-C only clusters named "
+             "through the guidance graph, graph_match.py) and weights every RNA type so the "
+             "reference has that composition, so the alignment does not have to move Hi-C "
+             "cells onto over-represented reference types (a label-free --match_composition; "
+             "single resolution, not with --balance). 'none' weights all cells equally. "
+             "'auto' (default) is 'graph' for single resolution models of unpaired data, 'none' "
+             "when most Hi-C cells are also RNA cells (same composition by construction) or with "
+             "--resolutions, --balance or --match_composition"
+    )
+    glue_parser.add_argument('--comp_weight_temperature', type=float, default=0.0,
+                             help='0 (default): the composition estimate counts the cells of every cluster '
+                                  'toward its name; > 0 spreads every cluster over the types by a softmax of '
+                                  'its match z-scores at this temperature (helped PFC at a too coarse Leiden '
+                                  'resolution, hurt the islet atlas, where similar types have close z-scores)')
+    glue_parser.add_argument('--comp_weight_floor', type=float, default=0.1,
+                             help='share of a reference type\'s weight kept when the estimate '
+                                  'does not find it in the Hi-C cells')
     glue_parser.add_argument('--normalize_u', action='store_true')
     glue_parser.add_argument('--binarize', action='store_true')
     glue_parser.add_argument('--use_batch', type=str, default=None)
     glue_parser.add_argument('--use_rna_pca', action='store_true')
     glue_parser.add_argument('--use_atac_counts', action='store_true')
     glue_parser.add_argument('--cache_checkpoint', type=str, default=None)
+    glue_parser.add_argument(
+        '--eval_dir', type=str, default=None,
+        help='where evaluation metrics, plots and embeddings are written '
+             '(default: <exp_name>/eval)'
+    )
+    # chromatin structure analysis at the end of training (structure_eval.py)
+    glue_parser.add_argument(
+        '--structure_eval', action='store_true',
+        help='after training, pool Hi-C cells by predicted and annotated type into '
+             'pseudobulk coolers and analyze insulation and A/B compartments at marker '
+             'genes and at cell type specific loci, next to the RNA expression of their '
+             'genes (writes <eval_dir>/structure)'
+    )
+    glue_parser.add_argument('--structure_scool', type=str, default=None,
+                             help='single-cell coolers for the structure analysis (default: --scool; '
+                                  'a finer resolution than the model, e.g. 100kb, works best)')
+    glue_parser.add_argument('--structure_binsize', type=int, default=None,
+                             help='pseudobulk grid in bp (default: the scool resolution, at least 100kb)')
+    glue_parser.add_argument('--structure_markers', type=str, default=None,
+                             help='TSV/CSV with columns celltype, gene (default: the dataset markers in evals.py)')
+    glue_parser.add_argument('--structure_min_cells', type=int, default=50, help='smallest pool')
+    glue_parser.add_argument('--structure_max_cells', type=int, default=1000,
+                             help='pools are subsampled to at most this many cells')
+    glue_parser.add_argument('--structure_top_loci', type=int, default=15,
+                             help='cell type specific loci per pool and feature')
+    glue_parser.add_argument(
+        '--decoder', choices=['composition_attention', 'composition', 'attention'],
+        default='composition_attention',
+        help="how the Hi-C decoder builds the loading of a contact between anchors i and "
+             "i + k: 'composition_attention' composes both anchors per dimension "
+             "(w1 * v_i + w2 * v_(i+k)) and refines the result with a pre-norm local attention "
+             "and feed-forward block (the multi-resolution decoder used for the islet results); "
+             "'composition' is the linear composition alone; 'attention' transforms v_i and "
+             "mixes in neighboring anchors with local attention, without the partner anchor "
+             "(the earlier single resolution decoder)"
+    )
     glue_parser.add_argument(
         '--strata_weights', choices=['cell', 'global'], default='cell',
         help="how the library size is split across strata: 'cell' predicts it "
@@ -227,6 +299,15 @@ if __name__ == '__main__':
         '--no_strata_input_norm', action='store_true',
         help='do not divide each stratum by its typical magnitude before the '
              'log transform of the encoder input'
+    )
+    glue_parser.add_argument(
+        '--decay_norm', choices=['none', 'cell'], default='none',
+        help="per-cell distance-decay normalization of the Hi-C data (single resolution): "
+             "'cell' scales every stratum of a cell by the cell's own total in that stratum "
+             "before encoding, and decodes every stratum with its observed total as library "
+             "size, so the embedding does not carry how a cell's contacts are spread over "
+             "distances (e.g. library differences between donors); overrides --strata_weights. "
+             "'none' normalizes by the cell's total only"
     )
     glue_parser.add_argument(
         '--lam_downsample', type=float, default=0.0,
@@ -291,9 +372,9 @@ if __name__ == '__main__':
                              default=(2, 8))
     glue_parser.add_argument('--multires_conv_pool_width', type=int, default=32)
     glue_parser.add_argument(
-        '--multires_use_attn', action=argparse.BooleanOptionalAction, default=True,
-        help='use local attention over anchor embeddings in the '
-             'multi-resolution decoder (on by default)'
+        '--multires_use_attn', action=argparse.BooleanOptionalAction, default=None,
+        help='add local attention over anchor embeddings to the composition in the '
+             'multi-resolution decoder (default: on with --decoder attention)'
     )
     glue_parser.add_argument(
         '--multires_attn_window', type=int, default=None,
@@ -309,6 +390,52 @@ if __name__ == '__main__':
         '--backed', action='store_true',
         help='read the Hi-C dataset from disk one minibatch at a time'
     )
+    # baselines evaluated on the same cells after training (results in <eval_dir>/baselines)
+    glue_parser.add_argument(
+        '--baselines', nargs='+', choices=['scgad', 'graph_match'], default=[],
+        help='also run these baselines on the cells HiGLUE was trained on: '
+             'scgad = scGAD gene scores integrated with the RNA by Harmony (scgad.py); '
+             'graph_match = Hi-C only clusters named through the guidance graph, without '
+             'any composition matching (graph_match.py; single resolution)'
+    )
+    glue_parser.add_argument('--graph_match_resolution', type=lambda v: v if v == 'auto' else float(v),
+                             default='auto',
+                             help='Leiden resolution of the Hi-C only clusters of graph_match (the baseline '
+                                  'and --comp_weight graph); auto scans several and keeps the one whose '
+                                  'clusters match their types best')
+    glue_parser.add_argument('--scgad_scool', type=str, default=None,
+                             help='single-cell coolers for scGAD (default: --scool; '
+                                  'scGAD is meant for high resolution, e.g. 5kb)')
+    glue_parser.add_argument('--scgad_features', type=int, default=2000,
+                             help='variable RNA genes used to co-embed GAD scores and RNA')
+    glue_parser.add_argument('--scgad_pcs', type=int, default=30)
+    glue_parser.add_argument('--scgad_jobs', type=int, default=8,
+                             help='processes reading cells for scGAD')
+    # gene-body contact counts of the Hi-C cells as a third, paired modality (scgad.gad_modality)
+    glue_parser.add_argument(
+        '--gad_modality', action=argparse.BooleanOptionalAction, default=None,
+        help='add the scGAD gene-body contact counts of the Hi-C cells as a modality "gad", '
+             'paired with the Hi-C cells, with one feature per variable gene linked to that gene '
+             '(default: on for single resolution models; --no-gad_modality turns it off). Pass a '
+             'high resolution .scool with --gad_scool or --scgad_scool'
+    )
+    glue_parser.add_argument('--gad_scool', type=str, default=None,
+                             help='single-cell coolers for the gene-body counts '
+                                  '(default: --scgad_scool, else --scool); finer resolutions separate more genes')
+    glue_parser.add_argument('--gad_weight', type=float, default=1.0,
+                             help='modality weight of the gene-body counts (Hi-C uses --hic_weight)')
+    glue_parser.add_argument('--gad_min_cells', type=float, default=0.01,
+                             help='fraction of cells a gene needs gene-body contacts in')
+    # figures during training (<exp_name>/viz), see scglue.models.plugins.EmbeddingVisualizer
+    glue_parser.add_argument(
+        '--viz', choices=['full', 'basic', 'none'], default='full',
+        help='training figures every --save_interval epochs: full (cells, joint, confusion, '
+             'decoder parameters, feature embeddings, loci), basic (no feature embeddings or '
+             'loci) or none (metrics only)'
+    )
+    glue_parser.add_argument('--viz_loci', type=int, default=3,
+                             help='loci drawn during training: the first N genes of --gene_list '
+                                  'found in the graph')
 
     glue_args = sys.argv.index('SCORE')
     args = glue_parser.parse_args(sys.argv[1:glue_args] + sys.argv[glue_args + 1:])
@@ -345,6 +472,11 @@ if __name__ == '__main__':
     coassay = args.coassay
     if coassay is None:
         coassay = []
+    if args.gad_modality is None:
+        args.gad_modality = not args.resolutions
+    if args.gad_modality:
+        # the gene-body counts are measured on the Hi-C cells themselves
+        coassay = sorted(set(coassay) | {'hic', 'gad'})
     exp_name = args.exp_name
     save_interval = args.save_interval
     latent_dim = args.latent_dim
@@ -361,7 +493,9 @@ if __name__ == '__main__':
     graph_file_suffix = f"{prior_name}_prior_{resolution}_{hic_type}_{loop_q}_{suffix}_{n_strata}"
     use_rep = None
     min_depth = args.min_depth
-    use_attn = True
+    use_attn = args.decoder != 'composition'
+    if args.multires_use_attn is None:
+        args.multires_use_attn = use_attn
     binarize = args.binarize
     use_wandb = args.wandb
     skip_balance = not args.balance
@@ -372,6 +506,10 @@ if __name__ == '__main__':
     methyl_file = args.methyl_file
 
     multires = bool(args.resolutions)
+    if multires and args.decay_norm != 'none':
+        glue_parser.error('--decay_norm is only implemented for single resolution models')
+    if args.comp_weight == 'graph' and (multires or args.balance):
+        glue_parser.error('--comp_weight is for single resolution models without --balance')
     if multires:
         # Resolutions are always ordered coarse to fine
         resolutions = sorted(args.resolutions, key=mh.parse_resolution, reverse=True)
@@ -466,9 +604,6 @@ if __name__ == '__main__':
             hic.layers['counts'] = hic.X.copy()
 
         celltypes = list(hic.obs['celltype'].unique())
-        n_clusters = len(celltypes)
-        colors = list(plt.cm.tab20(np.int32(np.linspace(0, n_clusters + 0.99, n_clusters))))
-        color_map = {celltype: colors[i] for i, celltype in enumerate(celltypes)}
         if 'pfc' in dataset_name:
             neurons_rna_celltypes = ['IN-PV', 'IN-SST', 'IN-VIP', 'IN-SV2C', 'Neu-mat',
                       'L2/3', 'L4', 'L5', 'L5/6', 'L6', 'L5/6-CC']
@@ -497,19 +632,6 @@ if __name__ == '__main__':
             rna = rna[~rna.obs['celltype'].isin(['Neu-NRGN-I', 'Neu-NRGN-II', 'Neu-mat'])]
             #rna = rna[~rna.obs['celltype'].isin(['Neu-NRGN-I', 'Neu-NRGN-II'])]
             rna = rna[rna.obs['celltype'].isin(neurons_rna_celltypes)]
-            color_map = {
-                "L2/3": [230, 25, 75],
-                "L4": [60, 180, 75],
-                "L5": [255, 225, 25],
-                "L6": [0, 130, 200],
-                "Ndnf": [245, 130, 49],
-                "Vip": [145, 30, 180],
-                "Pvalb": [70, 240, 240],
-                "Sst": [240, 50, 230]}
-            color_map = {celltype: [c / 255.0 for c in color] for celltype, color in color_map.items()}
-            color_map['Neu'] = 'gray'
-            color_map['Neu_rna'] = 'gray'
-            colors = list(color_map.values())
             rna.obs['celltype'] = rna.obs['celltype'].map(rna_celltype_map)
         elif 'human_brain' in dataset_name:
             neurons_rna_celltypes = ['IN-PV', 'IN-SST', 'IN-VIP', 'IN-SV2C', 'Neu-mat',
@@ -554,10 +676,28 @@ if __name__ == '__main__':
                     hic_celltype_map[celltype] = celltype
             rna.obs['celltype'] = rna.obs['celltype'].map(rna_celltype_map)
 
+        if args.celltypes:
+            # after any dataset specific relabeling above, so the names given
+            # match the final labels (preprocessing still used all cells)
+            filter_modalities = {"rna": rna, "hic": hic}
+            if atac_file is not None:
+                filter_modalities["atac"] = atac
+            if methyl_file is not None:
+                filter_modalities["methyl"] = methyl
+            filter_modalities = evals.filter_celltypes(
+                filter_modalities, args.celltypes, label_key="celltype", dataset_name=dataset_name
+            )
+            rna, hic = filter_modalities["rna"], filter_modalities["hic"]
+            if atac_file is not None:
+                atac = filter_modalities["atac"]
+            if methyl_file is not None:
+                methyl = filter_modalities["methyl"]
+            celltypes = list(hic.obs['celltype'].astype(str).unique())
+
+        if args.match_composition:
+            rna = evals.match_composition(rna, hic, label_key="celltype", dataset_name=dataset_name, seed=seed)
+
         rna_celltypes = rna.obs['celltype'].unique()
-        for celltype in rna_celltypes:
-            if celltype not in celltypes:
-                color_map[celltype] = colors[-1]
         rna.obs['celltype'] = pd.Categorical(rna.obs['celltype'], categories=rna_celltypes, ordered=True)
         hic.obs['celltype'] = pd.Categorical(hic.obs['celltype'], categories=celltypes, ordered=True)
         if atac_file is not None:
@@ -584,6 +724,8 @@ if __name__ == '__main__':
                             'filter_strata': filter_strata,
                             'min_count': min_count,
                             'n_genes': n_genes,
+                            'celltypes': args.celltypes,
+                            'match_composition': args.match_composition,
                             'rna_pca': use_rna_pca,
                             'latent_dim': latent_dim,
                             'h_dim': h_dim,
@@ -594,7 +736,11 @@ if __name__ == '__main__':
                             'use_trans': use_trans,
                             'normalize_u': normalize_u,
                             'use_attn': args.multires_use_attn if multires else use_attn,
+                            'decoder': args.decoder,
                             'distances_normalized': args.use_dist_norm,
+                            'gene_edges': args.gene_edges,
+                            'gad_modality': args.gad_modality,
+                            'gad_weight': args.gad_weight if args.gad_modality else None,
                             'binarize': binarize,
                             'lr': lr,
                             'hic_weight': hic_weight,
@@ -605,6 +751,11 @@ if __name__ == '__main__':
                             'lam_downsample': args.lam_downsample,
                             'strata_weights': args.strata_weights,
                             'strata_input_norm': not args.no_strata_input_norm,
+                            'decay_norm': args.decay_norm,
+                            'comp_weight': args.comp_weight,
+                            'comp_weight_floor': args.comp_weight_floor if args.comp_weight != 'none' else None,
+                            'comp_weight_temperature': args.comp_weight_temperature if args.comp_weight != 'none' else None,
+                            'graph_match_resolution': args.graph_match_resolution,
                             'depth_correction': depth_correction,
                             'use_batch': use_batch,
                             'seed': seed,
@@ -660,6 +811,73 @@ if __name__ == '__main__':
             atac.obs_names_make_unique()
         if methyl_file is not None:
             methyl.obs_names_make_unique()
+        if args.gad_modality:
+            import scgad
+            if not (args.gad_scool or args.scgad_scool):
+                print(f"WARNING: gene-body counts from --scool ({args.scool}); a high resolution "
+                      f".scool (--gad_scool, e.g. 5kb) separates genes far better")
+            gad = scgad.gad_modality(
+                rna, hic, args.gad_scool or args.scgad_scool or args.scool,
+                genes=rna.var_names[rna.var["highly_variable"]], min_cells=args.gad_min_cells,
+                n_jobs=args.scgad_jobs, cache_dir=os.path.join(out_dir, "baselines")
+            )
+            scgad.add_gad_edges(prior, gad)
+            scglue.models.configure_dataset(gad, "NB", use_highly_variable=True, use_layer="counts",
+                                            use_batch="batch", use_depth="depth" if depth_correction else None,
+                                            use_obs_names=True)
+            print(f"Number of paired Hi-C / gene-body cells: {gad.n_obs}")
+
+        eval_dir = args.eval_dir or os.path.join(exp_name or "glue", "eval")
+        graph_match_result = None
+        comp_weight = args.comp_weight
+        if comp_weight == 'auto':
+            paired = float(np.mean(hic.obs_names.isin(rna.obs_names))) >= 0.5
+            comp_weight = 'none' if (multires or args.balance or args.match_composition or paired) else 'graph'
+            print(f"--comp_weight auto: {comp_weight}"
+                  + (" (the Hi-C cells are paired with RNA cells)" if paired else ""))
+            if use_wandb:
+                wandb.config.update({"comp_weight": comp_weight}, allow_val_change=True)
+        if comp_weight == 'graph':
+            # Hi-C composition estimated without the adversary (graph_match.py),
+            # given to the reference through the discriminator weights of its cells
+            import graph_match
+            graph_match_result = graph_match.match(
+                rna, hic, prior, "celltype",
+                evals.get_label_map(dataset_name, hic.obs['celltype'], rna.obs['celltype']),
+                resolution=args.graph_match_resolution, seed=seed
+            )
+            weights, weight_table = graph_match.composition_weights(
+                graph_match_result["rna_labels"],
+                graph_match.estimate_composition(graph_match_result, args.comp_weight_temperature),
+                floor=args.comp_weight_floor
+            )
+            rna.obs["comp_weight"] = weights
+            rna.uns[scglue.config.ANNDATA_KEY]["use_dsc_weight"] = "comp_weight"
+            weight_dir = os.path.join(eval_dir, "comp_weight")
+            os.makedirs(weight_dir, exist_ok=True)
+            weight_table.round(4).to_csv(os.path.join(weight_dir, "composition_weights.csv"))
+            graph_match_result["scan"].round(4).to_csv(os.path.join(weight_dir, "resolution_scan.csv"), index=False)
+            # the estimate can only be as fine as the Hi-C only clusters: reference types it
+            # never names keep only --comp_weight_floor of their weight
+            coverage = float(weight_table.loc[weight_table["hic_estimate"] > 0, "reference"].sum())
+            pd.Series({"leiden_resolution": graph_match_result["resolution"],
+                       "n_clusters": len(graph_match_result["table"]),
+                       "reference_types": len(weight_table),
+                       "types_named": int((weight_table["hic_estimate"] > 0).sum()),
+                       "reference_coverage": coverage}, name="value").to_csv(
+                os.path.join(weight_dir, "summary.csv"), header=True)
+            if coverage < 0.85:
+                print(f"WARNING: the composition estimate names reference types covering only "
+                      f"{coverage:.0%} of the reference; types it misses are down-weighted to "
+                      f"{args.comp_weight_floor}. With references much finer than the Hi-C only "
+                      f"clusters (e.g. human brain) the weights can hurt")
+            graph_match_result["table"].round(3).to_csv(os.path.join(weight_dir, "clusters.csv"), index=False)
+            graph_match.plot_composition(
+                {"graph matching": weight_table["hic_estimate"], "RNA reference": weight_table["reference"],
+                 "weighted reference": weight_table["weighted_reference"]},
+                os.path.join(weight_dir, "composition.png"))
+            print("Discriminator weights of the RNA cells (--comp_weight graph):\n"
+                  + weight_table.round(3).to_string())
 
         if methyl_file is not None and atac_file is not None:
             dataset_dict = {"rna": rna, "hic": hic, "atac": atac, "methyl": methyl}
@@ -673,18 +891,24 @@ if __name__ == '__main__':
         else:
             dataset_dict = {"rna": rna, "hic": hic}
             modality_weights = {'rna': 1.0, 'hic': hic_weight}
+        if args.gad_modality:
+            dataset_dict["gad"] = gad
+            modality_weights["gad"] = args.gad_weight
         init_kws = {"latent_dim": latent_dim,
                     "use_attn": use_attn,
+                    "decoder": args.decoder,
                     "binarize": binarize,
                     "h_dim": h_dim,
                     "h_depth": h_depth,
                     "n_strata": n_strata,
                     "cell_strata_weights": args.strata_weights == 'cell',
                     "strata_input_norm": not args.no_strata_input_norm,
+                    "decay_norm": args.decay_norm,
                     "random_seed": seed}
         if multires:
             init_kws.update({
                 "use_attn": args.multires_use_attn,
+                "decoder": None,  # --multires_use_attn (derived from --decoder unless given) decides
                 "multires_use_attn": args.multires_use_attn,
                 "multires_res_dim": args.multires_res_dim,
                 "multires_mlp_max_band": args.multires_mlp_max_band,
@@ -710,6 +934,7 @@ if __name__ == '__main__':
                         "lr": lr,
                         "modality_weight": modality_weights},
             balance_kws={"resolution": 1.0},
+            viz_kws={"genes": args.gene_list, "n_loci": args.viz_loci, "level": args.viz},
             fit_kws={"directory": "glue" if exp_name is None else exp_name,
                     "neg_samples": neg_samples,
                     "val_split": 0.05,
@@ -736,146 +961,30 @@ if __name__ == '__main__':
                 print(f"Per-resolution embedding X_glue_{res_name}: {res_embedding.shape}")
         if atac_file is not None:
             atac.obsm["X_glue"] = glue.encode_data("atac", atac)
-            atac.obs['domain'] = 'atac'
-            atac.obs['old_celltype'] = atac.obs['celltype']
         if methyl_file is not None:
             methyl.obsm["X_glue"] = glue.encode_data("methyl", methyl)
-            methyl.obs['domain'] = 'methyl'
-            methyl.obs['old_celltype'] = methyl.obs['celltype']
+        if args.gad_modality:
+            gad.obsm["X_glue"] = glue.encode_data("gad", gad)
 
-        rna.obs['domain'] = 'rna'
-        hic.obs['domain'] = 'hic'
-
-        rna.obs['old_celltype'] = rna.obs['celltype']
-        hic.obs['old_celltype'] = hic.obs['celltype']
-        
-        # run leiden clustering to identify clusters
-        sc.pp.neighbors(hic, use_rep="X_glue", metric="cosine")
-        sc.tl.leiden(hic)
-
-        sc.pp.neighbors(rna, use_rep="X_glue", metric="cosine")
-        sc.tl.leiden(rna)
-
+        # Metrics and plots (see evals.py). Only embeddings and annotations are
+        # used, so this also works for backed data; ground truth labels stay in
+        # obs['celltype'] and predictions go to obs['pred_celltype']
+        eval_modalities = {"rna": rna, "hic": hic}
         if atac_file is not None:
-            sc.pp.neighbors(atac, use_rep="X_glue", metric="cosine")
-            sc.tl.leiden(atac)
+            eval_modalities["atac"] = atac
         if methyl_file is not None:
-            sc.pp.neighbors(methyl, use_rep="X_glue", metric="cosine")
-            sc.tl.leiden(methyl)
-
-        # transfer labels to predict celltypes
-        scglue.data.transfer_labels(rna, hic, "celltype", use_rep="X_glue", n_neighbors=n_neighbors, metric="cosine")
-        try:
-            # map celltypes to integers
-            celltypes = hic.obs['old_celltype'].unique()
-            celltype_map = {c: i for i, c in enumerate(celltypes)}
-            hic.obs['old_celltype_int'] = hic.obs['old_celltype'].map(celltype_map)
-            hic.obs['celltype_int'] = hic.obs['celltype'].map(celltype_map)
-            hic.obs['celltype_int'] = hic.obs['celltype_int'].fillna(len(celltypes))
-            # compute full accuracy
-            accuracy = accuracy_score(hic.obs['old_celltype_int'], hic.obs['celltype_int'])
-            ari = adjusted_rand_score(hic.obs['old_celltype_int'], hic.obs['celltype_int'])
-            ari_leiden = adjusted_rand_score(hic.obs['old_celltype_int'], hic.obs['leiden'])
-            sil_score_leiden = silhouette_score(hic.obsm['X_glue'], hic.obs['leiden'])
-            sil_score_joint = silhouette_score(hic.obsm['X_glue'], hic.obs['celltype_int'])
-            sil_celltype = silhouette_score(hic.obsm['X_glue'], hic.obs['old_celltype_int'])
-            if use_wandb:
-                wandb.log({"accuracy": accuracy, 
-                        "ari": ari_leiden,
-                        "ari_label_transfer": ari,
-                        "celltype_asw": sil_celltype,
-                        "silhouette_score_leiden": sil_score_leiden,
-                        "silhouette_score_joint": sil_score_joint})
-
-            # also do the same for RNA
-            rna_celltypes = rna.obs['celltype'].unique()
-            print(rna_celltypes)
-            rna_celltype_map = {c: i for i, c in enumerate(rna_celltypes)}
-            print(rna_celltype_map)
-            rna.obs['old_celltype_int'] = rna.obs['old_celltype'].map(rna_celltype_map)
-            rna_accuracy = accuracy_score(rna.obs['old_celltype_int'], rna.obs['leiden'])
-            rna_ari = adjusted_rand_score(rna.obs['old_celltype_int'], rna.obs['leiden'])
-            rna_sil_score = silhouette_score(rna.obsm['X_glue'], rna.obs['leiden'])
-            if use_wandb:
-                wandb.log({"rna_accuracy": rna_accuracy, 
-                        "rna_ari": rna_ari,
-                        "rna_silhouette_score": rna_sil_score})
-                
-            # if atac file is provided, do the same for atac
-            if atac_file is not None:
-                try:
-                    scglue.data.transfer_labels(rna, atac, "celltype", use_rep="X_glue", n_neighbors=n_neighbors, metric="cosine")
-                    atac_celltypes = atac.obs['old_celltype'].unique()
-                    atac_celltype_map = {c: i for i, c in enumerate(atac_celltypes)}
-                    atac.obs['old_celltype_int'] = atac.obs['old_celltype'].map(atac_celltype_map)
-                    atac.obs['celltype_int'] = atac.obs['celltype'].map(atac_celltype_map)
-                    # replace NaNs with the last index
-                    atac.obs['celltype_int'] = atac.obs['celltype_int'].fillna(len(atac_celltypes))
-                    atac_accuracy = accuracy_score(atac.obs['old_celltype_int'], atac.obs['celltype_int'])
-                    atac_ari = adjusted_rand_score(atac.obs['old_celltype_int'], atac.obs['celltype_int'])
-                    atac_ari_leiden = adjusted_rand_score(atac.obs['old_celltype_int'], atac.obs['leiden'])
-                    atac_sil_score = silhouette_score(atac.obsm['X_glue'], atac.obs['celltype_int'])
-                    if use_wandb:
-                        wandb.log({"atac_accuracy": atac_accuracy, 
-                                "atac_ari": atac_ari,
-                                "atac_ari_leiden": atac_ari_leiden,
-                                "atac_silhouette_score": atac_sil_score})
-                except Exception as e:
-                    print(e)
-            # if methyl file is provided, do the same for methyl
-            if methyl_file is not None:
-                try:
-                    scglue.data.transfer_labels(rna, methyl, "celltype", use_rep="X_glue", n_neighbors=n_neighbors, metric="cosine")
-                    methyl_celltypes = methyl.obs['old_celltype'].unique()
-                    methyl_celltype_map = {c: i for i, c in enumerate(methyl_celltypes)}
-                    methyl.obs['old_celltype_int'] = methyl.obs['old_celltype'].map(methyl_celltype_map)
-                    methyl.obs['celltype_int'] = methyl.obs['celltype'].map(methyl_celltype_map)
-                    # replace NaNs with the last index
-                    methyl.obs['celltype_int'] = methyl.obs['celltype_int'].fillna(len(methyl_celltypes))
-                    methyl_accuracy = accuracy_score(methyl.obs['old_celltype_int'], methyl.obs['celltype_int'])
-                    methyl_ari = adjusted_rand_score(methyl.obs['old_celltype_int'], methyl.obs['celltype_int'])
-                    methyl_ari_leiden = adjusted_rand_score(methyl.obs['old_celltype_int'], methyl.obs['leiden'])
-                    methyl_sil_score = silhouette_score(methyl.obsm['X_glue'], methyl.obs['celltype_int'])
-                    if use_wandb:
-                        wandb.log({"methyl_accuracy": methyl_accuracy, 
-                                "methyl_ari": methyl_ari,
-                                "methyl_ari_leiden": methyl_ari_leiden,
-                                "methyl_silhouette_score": methyl_sil_score})
-                except Exception as e:
-                    print(e)
-
-        except Exception as e:
-            print(e)
-            pass
-        
-        combined_modalities = [("rna", rna), ("hic", hic)]
-        if atac_file is not None:
-            combined_modalities.append(("atac", atac))
-        if methyl_file is not None:
-            combined_modalities.append(("methyl", methyl))
-        # only the embeddings and annotations are needed downstream, and reading
-        # `X` of a backed dataset here would defeat the lazy loading
-        combined = ad.concat([
-            ad.AnnData(obs=adata.obs.copy(), obsm={"X_glue": adata.obsm["X_glue"]})
-            for _, adata in combined_modalities
-        ])
-
-        sc.pp.neighbors(hic, use_rep="X_glue", metric="cosine", n_neighbors=n_neighbors)
-        sc.tl.umap(hic)
-        fig = sc.pl.umap(hic, color=["old_celltype", "celltype", "celltype_confidence", "read_depth", "batch"], palette=color_map,wspace=0.45, return_fig=True)
-        fig.savefig('glue_umap.png')
-        plt.close()
-        if use_wandb:
-            wandb.log({"hic_umap": wandb.Image('glue_umap.png')})
-
-        sc.pp.neighbors(combined, use_rep="X_glue", metric="cosine", n_neighbors=n_neighbors)
-        sc.tl.umap(combined)
-        fig = sc.pl.umap(combined, color=["domain"], wspace=0.45, return_fig=True)
-        plt.tight_layout()
-        fig.savefig('glue_joint_umap.png')
-        plt.close()
-        if use_wandb:
-            wandb.log({"joint_umap": wandb.Image('glue_joint_umap.png')})
+            eval_modalities["methyl"] = methyl
+        if args.gad_modality:
+            # metrics of the gene-body encoder are prefixed with gad_
+            eval_modalities["gad"] = gad
+        metrics, combined = evals.evaluate(
+            eval_modalities, eval_dir, label_key="celltype", reference="rna",
+            dataset_name=dataset_name, n_neighbors=n_neighbors,
+            log_wandb=use_wandb, seed=seed
+        )
+        print(f"Saved evaluation to {eval_dir}")
+        # same modality order as `combined`
+        combined_modalities = list(eval_modalities.items())
 
         if args.gene_list:
             configured_rna_features = pd.Index(rna.uns[scglue.config.ANNDATA_KEY]["features"])
@@ -912,202 +1021,93 @@ if __name__ == '__main__':
                         output_path
                     ):
                         print(f"Saved predicted transcriptional activity UMAP for {gene_label} to {output_path}")
-                        if use_wandb:
-                            wandb.log({
-                                f"predicted_transcriptional_activity_{_sanitize_plot_name(requested_gene)}": wandb.Image(output_path)
-                            })
-
-        # if any cells are paired, check their embedding distance
-        avg_paired_dist = 0
-        paired_mask = hic.obs_names.isin(rna.obs_names)
-        avg_corr = 0
-        avg_paired_expr_corr = 0
-        avg_paired_dist = 0
-        if np.sum(paired_mask) > 0:
-            # only the embeddings are compared, so avoid touching `X` (which a
-            # backed dataset cannot copy)
-            paired_hic = ad.AnnData(
-                obs=hic.obs.copy(), obsm={"X_glue": hic.obsm["X_glue"]}
-            )[paired_mask].copy()
-            paired_rna = rna[rna.obs_names.isin(paired_hic.obs_names)].copy()
-            hic_z = paired_hic.obsm['X_glue']
-            rna_z = paired_rna.obsm['X_glue']
-            print(hic_z.shape, rna_z.shape)
-            dists = np.linalg.norm(hic_z - rna_z, axis=1)
-            corrs = []
-            for i in range(hic_z.shape[0]):
-                corr, _ = pearsonr(hic_z[i], rna_z[i])
-                corrs.append(corr)
-            avg_paired_dist = np.mean(dists)
-            avg_corr = np.mean(corrs)
-            print(f"Avg. embedding distance between paired cells: {avg_paired_dist}")
-            print(f"Avg. embedding correlation between paired cells: {avg_corr}")
-            if use_wandb:
-                wandb.log({"paired_distance": avg_paired_dist, "paired_correlation": avg_corr})
+                        # if use_wandb:
+                        #     wandb.log({
+                        #         f"predicted_transcriptional_activity_{_sanitize_plot_name(requested_gene)}": wandb.Image(output_path)
+                        #     })
 
         if cache_checkpoint:
             # save the cell type predictions and cell coordinates
             pred_checkpoint = f"{cache_checkpoint}_predictions"
             os.makedirs(pred_checkpoint, exist_ok=True)
             n_checkpoints = len(os.listdir(pred_checkpoint))
-            combined_hic_only = combined[combined.obs['domain'] == 'hic']
-            neighbors_list = [5, 10, 15, 20, 50]
-            df = {'cell': list(hic.obs_names), 'old_celltype': list(hic.obs['old_celltype']), 
-                  'combined_umap_1': list(combined_hic_only.obsm['X_umap'][:, 0]),
-                  'combined_umap_2': list(combined_hic_only.obsm['X_umap'][:, 1])}
-            for neighbors in neighbors_list:
-                scglue.data.transfer_labels(rna, hic, "celltype", use_rep="X_glue", n_neighbors=neighbors, metric="cosine")
-                df[f'celltype_{neighbors}'] = list(hic.obs['celltype'])
-            df = pd.DataFrame(df)
-            df['resolution'] = resolution
-            df['n_genes'] = n_genes
-            df['n_strata'] = n_strata
-            df['filter_strata'] = filter_strata
-            df['loop_q'] = loop_q
-            df.to_csv(f"{pred_checkpoint}/celltype_prediction_{n_checkpoints}.csv", index=False)
-            print(df)
-
-        fig = sc.pl.umap(combined[combined.obs["domain"] == "hic"], color=["old_celltype", "celltype"], palette=color_map, wspace=0.45, return_fig=True)
-        fig.savefig('glue_joint_umap_hic.png')
-        plt.close()
-        if use_wandb:
-            wandb.log({"joint_umap_hic": wandb.Image('glue_joint_umap_hic.png')})
-
-        fig = sc.pl.umap(combined[combined.obs["domain"] == "rna"], color=["celltype"], palette=color_map, wspace=0.45, return_fig=True)
-        fig.savefig('glue_joint_umap_rna.png')
-        plt.close()
-        if use_wandb:
-            wandb.log({"joint_umap_rna": wandb.Image('glue_joint_umap_rna.png')})
-
-        rna_mask = combined.obs['domain'] == 'rna'
-        
-        combined.obs['old_celltype'] = combined.obs['old_celltype'].astype(str)
-        combined.obs['celltype'] = combined.obs['celltype'].astype(str)
-        combined.obs.loc[rna_mask, 'old_celltype'] += '_rna'
-        combined.obs.loc[rna_mask, 'celltype'] += '_rna'
-        
-        rna_color_map = {celltype + '_rna': colors[i] for i, celltype in enumerate(celltypes)}
-        # add any missing celltypes from RNA
-        rna_celltypes = rna.obs['celltype'].unique()
-        for celltype in rna_celltypes:
-            if celltype not in celltypes:
-                rna_color_map[celltype + '_rna'] = colors[-1]
-        if atac_file is not None:
-            atac_mask = combined.obs['domain'] == 'atac'
-            atac_celltypes = atac.obs['celltype'].unique()
-            print(atac_celltypes)
-            combined.obs.loc[atac_mask, 'old_celltype'] += '_atac'
-            combined.obs.loc[atac_mask, 'celltype'] += '_atac'
-            atac_color_map = {celltype + '_atac': colors[i] for i, celltype in enumerate(celltypes)}
-            for celltype in atac_celltypes:
-                if celltype not in celltypes:
-                    atac_color_map[str(celltype) + '_atac'] = colors[-1]
-            rna_color_map = {**rna_color_map, **atac_color_map}
-        if methyl_file is not None:
-            methyl_mask = combined.obs['domain'] == 'methyl'
-            methyl_celltypes = methyl.obs['celltype'].unique()
-            print(methyl_celltypes)
-            combined.obs.loc[methyl_mask, 'old_celltype'] += '_methyl'
-            combined.obs.loc[methyl_mask, 'celltype'] += '_methyl'
-            methyl_color_map = {celltype + '_methyl': colors[i] for i, celltype in enumerate(celltypes)}
-            for celltype in methyl_celltypes:
-                if celltype not in celltypes:
-                    methyl_color_map[str(celltype) + '_methyl'] = colors[-1]
-            rna_color_map = {**rna_color_map, **methyl_color_map}
-        color_map = {**color_map, **rna_color_map}
-        color_map['Other'] = 'gray'
-        
-        try:
-            fig = sc.pl.umap(combined, color=["celltype" if 'islet' in dataset_name else 'old_celltype'], groups=celltypes, palette=color_map, size=100, wspace=0.45, return_fig=True)
-            fig.savefig('glue_joint_umap_separate.png')
-            plt.close()
-            if use_wandb:
-                wandb.log({"joint_umap_separate": wandb.Image('glue_joint_umap_separate.png')})
-        except Exception as e:
-            print(e)
-            pass
-
-        if atac_file is not None:
-            try:
-                fig = sc.pl.umap(combined[combined.obs["domain"] == "atac"], color=["old_celltype", "celltype"], wspace=0.45, return_fig=True)
-                fig.savefig('glue_joint_umap_atac.png')
-                plt.close()
-                if use_wandb:
-                    wandb.log({"joint_umap_atac": wandb.Image('glue_joint_umap_atac.png')})
-            except Exception as e:
-                print(e)
-                pass
-            try:
-                atac_celltypes = [c + '_atac' for c in atac_celltypes]
-                if 'islet' in dataset_name or 'pfc' in dataset_name:  # paired celltype names
-                    atac_color_map = color_map
-                else:
-                    atac_color_map = sc.pl.palettes.godsnot_102
-                fig = sc.pl.umap(combined, color=["old_celltype", "celltype"], groups=atac_celltypes, palette=atac_color_map, size=100, wspace=0.65, return_fig=True)
-                fig.savefig('glue_joint_umap_separate_atac.png')
-                plt.close()
-                if use_wandb:
-                    wandb.log({"joint_umap_separate_atac": wandb.Image('glue_joint_umap_separate_atac.png')})
-            except Exception as e:
-                print(e)
-        
-        if methyl_file is not None:
-            try:
-                fig = sc.pl.umap(combined[combined.obs["domain"] == "methyl"], color=["old_celltype", "celltype"], wspace=0.65, return_fig=True)
-                fig.savefig('glue_joint_umap_methyl.png')
-                plt.close()
-                if use_wandb:
-                    wandb.log({"joint_umap_methyl": wandb.Image('glue_joint_umap_methyl.png')})
-            except Exception as e:
-                print(e)
-                pass
-            try:
-                methyl_celltypes = [c + '_methyl' for c in methyl_celltypes]
-                if 'islet' in dataset_name or 'pfc' in dataset_name:  # paired celltype names
-                    methyl_color_map = color_map
-                else:
-                    methyl_color_map = sc.pl.palettes.godsnot_102
-                fig = sc.pl.umap(combined, color=["old_celltype", "celltype"], groups=methyl_celltypes, palette=methyl_color_map, size=100, wspace=0.65, return_fig=True)
-                fig.savefig('glue_joint_umap_separate_methyl.png')
-                plt.close()
-                if use_wandb:
-                    wandb.log({"joint_umap_separate_methyl": wandb.Image('glue_joint_umap_separate_methyl.png')})
-            except Exception as e:
-                print(e)
-        
-
-        # save combined data
-        os.makedirs(f"{out_dir}/combined_embedding", exist_ok=True)
-        #combined.write(f"{out_dir}/combined_embedding/combined_{full_file_suffix}.h5ad", compression="gzip")
-
-        if 'islet' in dataset_name:
-            sorted_mask = (
-                hic.obs_names.str.contains('alpha', case=False, regex=False, na=False)
-                | hic.obs_names.str.contains('beta', case=False, regex=False, na=False)
+            evals.save_predictions(
+                hic, rna, combined, f"{pred_checkpoint}/celltype_prediction_{n_checkpoints}.csv",
+                label_map=evals.get_label_map(dataset_name, hic.obs['celltype'], rna.obs['celltype']),
+                extra={'resolution': resolution, 'n_genes': n_genes, 'n_strata': n_strata,
+                       'filter_strata': filter_strata, 'loop_q': loop_q}
             )
-            # embeddings and labels only, so this also works for backed data
-            sorted_hic = ad.AnnData(
-                obs=hic.obs.copy(), obsm={"X_glue": hic.obsm["X_glue"]}
-            )[sorted_mask].copy()
-            sorted_rna = rna[rna.obs['celltype'].isin(['Alpha', 'Beta'])]
-            sorted_hic.obs['sorted_celltype'] = sorted_hic.obs['celltype']
-            celltypes = sorted(sorted_hic.obs['celltype'].unique())
-            celltype_map = {c: i for i, c in enumerate(celltypes)}
-            sorted_hic.obs['celltype_int'] = sorted_hic.obs['celltype'].map(celltype_map)
+
+        if 'scgad' in args.baselines:
+            # same cells and metrics as above (scgad.py); a failure here should not
+            # lose the outputs of a finished training run
             try:
-                scglue.data.transfer_labels(sorted_rna, sorted_hic, "celltype", use_rep="X_glue", n_neighbors=5, key_added="pred_celltype_sorted", metric="cosine")
-                sorted_hic.obs['pred_celltype_int'] = sorted_hic.obs['pred_celltype_sorted'].map(celltype_map)
-                # measure accuracy
-                val_accuracy = accuracy_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
-                val_ari = adjusted_rand_score(sorted_hic.obs['celltype_int'], sorted_hic.obs['pred_celltype_int'])
-                if use_wandb:
-                    wandb.log({"val_accuracy": val_accuracy, "val_ari": val_ari})
-                val_celltype_asw = silhouette_score(sorted_hic.obsm['X_glue'], sorted_hic.obs['celltype_int'])
-                if use_wandb:
-                    wandb.log({"val_celltype_asw": val_celltype_asw})
-            except Exception as e:
-                print(e)
-                pass
+                import scgad
+                scgad_dir = os.path.join(eval_dir, "baselines", "scgad")
+                scgad.run_baseline(
+                    rna, hic, args.scgad_scool or args.scool, scgad_dir,
+                    label_key="celltype", dataset_name=dataset_name, n_neighbors=n_neighbors,
+                    n_features=args.scgad_features, n_pcs=args.scgad_pcs, n_jobs=args.scgad_jobs,
+                    cache_dir=os.path.join(out_dir, "baselines"), seed=seed, log_wandb=use_wandb
+                )
+                print(f"Saved scGAD baseline to {scgad_dir}")
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                print(f"scGAD baseline failed: {e}")
+
+        if 'graph_match' in args.baselines:
+            # same cells and metrics as above (graph_match.py); reuses the clusters of
+            # --comp_weight graph. A failure here should not lose a finished run
+            try:
+                import graph_match
+                if multires:
+                    raise ValueError("graph_match needs the single resolution band features")
+                hic_pred = combined.obs.loc[combined.obs["domain"].astype(str) == "hic",
+                                            "pred_celltype_harmonized"].astype(str)
+                graph_match_dir = os.path.join(eval_dir, "baselines", "graph_match")
+                graph_match.run_baseline(
+                    rna, hic, prior, graph_match_dir, label_key="celltype", dataset_name=dataset_name,
+                    n_neighbors=n_neighbors, resolution=args.graph_match_resolution, seed=seed,
+                    result=graph_match_result, compare={"HiGLUE": hic_pred.value_counts(normalize=True)},
+                    log_wandb=use_wandb
+                )
+                print(f"Saved graph matching baseline to {graph_match_dir}")
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                print(f"Graph matching baseline failed: {e}")
+
+        if args.structure_eval:
+            # chromatin structure of pseudobulk pools (structure_eval.py); a failure
+            # here should not lose the outputs of a finished training run
+            try:
+                hic_obs = combined.obs[combined.obs["domain"].astype(str) == "hic"]
+                groupings = {"predicted": hic_obs["pred_celltype_harmonized"].astype(str)}
+                truth = hic.obs["celltype"].astype(str)
+                truth = truth[~truth.isin(evals.UNLABELED)]
+                if len(truth) >= args.structure_min_cells:
+                    groupings["truth"] = truth
+                structure_dir = os.path.join(eval_dir, "structure")
+                structure_metrics = structure_eval.run(
+                    groupings, args.structure_scool or args.scool, rna, structure_dir,
+                    markers=structure_eval.read_markers(args.structure_markers),
+                    dataset_name=dataset_name, graph=prior, binsize=args.structure_binsize,
+                    min_cells=args.structure_min_cells, max_cells=args.structure_max_cells,
+                    top_loci=args.structure_top_loci, seed=seed, log_wandb=use_wandb,
+                    # the joint UMAP of the RNA cells, as in the evaluation plots
+                    rna_umap=pd.DataFrame(
+                        combined.obsm["X_umap"][(combined.obs["domain"].astype(str) == "rna").to_numpy()],
+                        index=combined.obs_names[(combined.obs["domain"].astype(str) == "rna").to_numpy()]
+                    )
+                )
+                pd.Series(structure_metrics, name="value").to_csv(
+                    os.path.join(structure_dir, "structure_metrics.csv"), header=True)
+                print(f"Saved structure analysis to {structure_dir}")
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                print(f"Structure analysis failed: {e}")
 
         if use_wandb:
             wandb.finish()

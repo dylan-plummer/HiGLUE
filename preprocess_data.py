@@ -8,6 +8,7 @@ from cooler._logging import set_verbosity_level
 import os
 import sys
 import itertools
+import hashlib
 import argparse
 import numpy as np 
 import pandas as pd
@@ -363,6 +364,23 @@ def load_methyl_modality(methyl_file, rna, gtf_file, n_genes, plot_dir):
     return methyl, methyl_genes
 
 
+def gene_regions(genes, promoters, mode="body"):
+    r"""
+    Regions of genes linked to the Hi-C anchors they overlap
+
+    ``"body"`` (default, as in the original HiGLUE): the gene body and 2kb
+    upstream, so a long gene is linked to every anchor it spans. Contacts within
+    the bodies of long, highly expressed genes track their expression (the
+    signal scGAD scores), which a promoter-only link misses. ``"promoter"``:
+    the TSS and 2kb upstream only.
+    """
+    if mode == "promoter":
+        return promoters
+    if mode != "body":
+        raise ValueError(f"Unknown gene_edges mode '{mode}'")
+    return genes.expand(2000, 0)
+
+
 def multires_extra_suffix(use_dist_norm, use_trans):
     """File name marker for pseudobulk edge options in multi-resolution mode."""
     parts = []
@@ -397,6 +415,7 @@ def preprocess_higlue_multires(args, glue_args):
     written, so neither preprocessing nor training needs the full dense matrix
     in memory.
     """
+    gene_edges = args.gene_edges  # args is replaced by the SCORE arguments below
     import multires_hic as mh
 
     resolutions = list(args.resolutions)
@@ -443,7 +462,9 @@ def preprocess_higlue_multires(args, glue_args):
     )
     genes = scglue.genomics.Bed(rna.var.assign(name=rna.var_names))
     promoters = genes.strand_specific_start_site().expand(2000, 0)
-    hv_promoters = promoters.loc[promoters.index.isin(
+    # regions linked to the Hi-C anchors that overlap them (see gene_regions)
+    linked = gene_regions(genes, promoters, gene_edges)
+    hv_promoters = linked.loc[linked.index.isin(
         rna.var.query("highly_variable").index
     )]
     print(f'{rna.shape[1]} genes ({rna.var["highly_variable"].sum()} highly variable)')
@@ -497,7 +518,7 @@ def preprocess_higlue_multires(args, glue_args):
         for res in resolutions:
             peaks[res] = scglue.genomics.Bed(mh.anchor_bed(grids[res], anchors[res]))
             overlap_graphs[res] = scglue.genomics.window_graph(
-                promoters, peaks[res], 0,
+                linked, peaks[res], 0,
                 attr_fn=lambda l, r, d: {"weight": 1.0, "type": "overlap", "sign": 1, "dist": 0.0}
             )
             prior = scglue.graph.compose_multigraph(
@@ -713,6 +734,7 @@ def preprocess_higlue_multires(args, glue_args):
 
 
 def preprocess_higlue(args, glue_args):
+    gene_edges = args.gene_edges  # args is replaced by the SCORE arguments below
     n_strata = args.n_strata
     resolution = args.resolution
     gtf_file = args.gtf
@@ -745,6 +767,8 @@ def preprocess_higlue(args, glue_args):
             n_loops = int(loop_q[:-1]) * 1000
     dataset_name = args.dset
     out_dir = f'data/{dataset_name}_data'
+    if args.data_dir != '':  # same location training reads from (higlue.py)
+        out_dir = f'{args.data_dir}'
     plot_dir = f'plots/{dataset_name}_plots'
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(os.path.join(out_dir, 'rna'), exist_ok=True)
@@ -760,10 +784,24 @@ def preprocess_higlue(args, glue_args):
     if bulk_hic is not None:
         bulk = cooler.Cooler(bulk_hic)
     else:
-        cool_files = cooler.fileops.list_scool_cells(dataset.scool_file)
-        cool_files = [f"{dataset.scool_file}::{cell}" for cell in cool_files]
+        # pool only the cells that are modeled (the .scool may hold more, e.g. all
+        # cells of an atlas when only its neurons are used)
+        scool_cells = cooler.fileops.list_scool_cells(dataset.scool_file)
+        modeled = set(str(cell) for cell in dataset.cell_list)
+        pooled = [cell for cell in scool_cells if cell.split('/')[-1] in modeled]
+        if not pooled:
+            print('WARNING: no modeled cell found in the .scool by name, pooling all cells')
+            pooled = scool_cells
+        print(f'Pseudobulk of {len(pooled):,} of {len(scool_cells):,} cells in the .scool')
+        cool_files = [f"{dataset.scool_file}::{cell}" for cell in pooled]
         os.makedirs('data/scools', exist_ok=True)
-        out_cool_file = f"data/scools/{dataset_name}_{resolution}_bulk.cool"
+        # the cache is keyed by the input file and the pooled cells, so a changed
+        # .scool or cell filter gets its own pseudobulk
+        stat = os.stat(dataset.scool_file)
+        bulk_key = hashlib.md5("\n".join(
+            [os.path.realpath(dataset.scool_file), str(stat.st_size), str(int(stat.st_mtime))] + pooled
+        ).encode()).hexdigest()[:8]
+        out_cool_file = f"data/scools/{dataset_name}_{resolution}_{bulk_key}_bulk.cool"
 
         try:
             bulk = cooler.Cooler(out_cool_file)
@@ -1045,6 +1083,7 @@ def preprocess_higlue(args, glue_args):
     peaks = scglue.genomics.Bed(diagonal_anchors.assign(name=hic.var_names[diagonal_mask]))
     tss = genes.strand_specific_start_site()
     promoters = tss.expand(2000, 0)
+    linked = gene_regions(genes, promoters, gene_edges)
     if atac_file is not None:
         atac_peaks = scglue.genomics.Bed(atac_peaks.assign(name=atac_peaks['name']))
     if methyl_file is not None: 
@@ -1064,7 +1103,7 @@ def preprocess_higlue(args, glue_args):
             return 1
 
     overlap_graph = scglue.genomics.window_graph(
-        promoters, peaks, 0,
+        linked, peaks, 0,
         attr_fn=lambda l, r, d: {
             "weight": 1.0,
             "type": "overlap",

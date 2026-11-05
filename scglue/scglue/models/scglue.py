@@ -988,10 +988,12 @@ class SCGLUEModel(Model):
             shifted_additive: bool = False,
             use_activation: bool = False,
             use_attn: bool = False,
+            decoder: Optional[str] = None,
             binarize: bool = False,
             n_strata: int = 5,
             cell_strata_weights: bool = True,
             strata_input_norm: bool = True,
+            decay_norm: str = "none",
             multires_res_dim: Optional[int] = None,
             multires_mlp_max_band: int = 262144,
             multires_conv_channels: Tuple[int, int, int] = (8, 16, 32),
@@ -1005,6 +1007,15 @@ class SCGLUEModel(Model):
     ) -> None:
         self.vertices = pd.Index(vertices)
         self.random_seed = random_seed
+        # Hi-C stratum keys: "composition_attention", "composition" or "attention"
+        # (see sc.StratifiedZINBDataDecoder); the multi-resolution decoder always
+        # composes, with attention unless "composition"
+        if decoder is not None:
+            multires_use_attn = decoder != "composition"
+        # "cell": per-cell distance-decay normalization of the Hi-C input and
+        # stratum library sizes (see sc.HiCDataEncoder); "none": one library size
+        if decay_norm not in ("none", "cell"):
+            raise ValueError(f"Unknown decay_norm '{decay_norm}'")
         torch.manual_seed(self.random_seed)
         self.use_node_attributes = use_node_attributes
         self.node_attr_dim = len(use_node_attributes) if use_node_attributes is not None else 0
@@ -1030,6 +1041,8 @@ class SCGLUEModel(Model):
                 )
             res_specs = None
             if data_config["prob_model"] in MULTIRES_PROB_MODELS:
+                if decay_norm != "none":
+                    raise NotImplementedError("decay_norm is only implemented for single resolution Hi-C")
                 res_specs, anchor_names = build_res_specs(
                     data_config, mlp_max_band=multires_mlp_max_band
                 )
@@ -1155,7 +1168,8 @@ class SCGLUEModel(Model):
                     strata_masks=strata_masks,
                     use_conv=use_conv,
                     strata_input_norm=strata_input_norm,
-                    downsample_min=0.5, downsample_max=0.9
+                    downsample_min=0.5, downsample_max=0.9,
+                    cell_decay_norm=decay_norm == "cell"
                 )
                 u2x[k] = _DECODER_MAP[data_config["prob_model"]](
                     len(data_config["features"]),
@@ -1169,7 +1183,9 @@ class SCGLUEModel(Model):
                     use_activation=use_activation,
                     use_attn=use_attn,
                     binarize=binarize,
-                    cell_strata_weights=cell_strata_weights
+                    cell_strata_weights=cell_strata_weights,
+                    key_mode=decoder,
+                    cell_decay_norm=decay_norm == "cell"
                 )
             else:
                 x2u[k] = _ENCODER_MAP[data_config["prob_model"]](
