@@ -9,6 +9,8 @@ paper
 islet_benchmark
 bench_runs
 bench_data
+triple_runs
+cluster_bundle
 
 figure_notebooks
 
