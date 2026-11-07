@@ -158,6 +158,9 @@ if __name__ == '__main__':
     glue_parser.add_argument('--n_strata', type=int, default=10)
     glue_parser.add_argument('--use_ice', action='store_true')
     glue_parser.add_argument('--use_dist_norm', action='store_true')
+    glue_parser.add_argument('--no_contact_edges', action='store_true',
+                             help='ablation: build the guidance graph without pseudobulk contact edges '
+                                  '(gene-bin overlap and adjacency of consecutive bins only; single resolution)')
     glue_parser.add_argument(
         '--gene_edges', choices=['body', 'promoter'], default='body',
         help='link each gene to the Hi-C bins overlapping its body (and 2kb upstream; the '
@@ -314,6 +317,8 @@ if __name__ == '__main__':
         help='weight of the depth consistency loss, which pulls a cell and a '
              'downsampled copy of it to the same embedding (0 disables it)'
     )
+    glue_parser.add_argument('--lam_depth', type=float, default=0.05,
+                             help='weight of the read-depth adversary on the Hi-C embedding (0 disables it)')
     glue_parser.add_argument('--downsample_min', type=float, default=0.3)
     glue_parser.add_argument('--downsample_max', type=float, default=0.9)
 
@@ -392,12 +397,22 @@ if __name__ == '__main__':
     )
     # baselines evaluated on the same cells after training (results in <eval_dir>/baselines)
     glue_parser.add_argument(
-        '--baselines', nargs='+', choices=['scgad', 'graph_match'], default=[],
+        '--baselines', nargs='+', choices=['scgad', 'scgad_cca', 'graph_match', 'loops'], default=[],
         help='also run these baselines on the cells HiGLUE was trained on: '
              'scgad = scGAD gene scores integrated with the RNA by Harmony (scgad.py); '
              'graph_match = Hi-C only clusters named through the guidance graph, without '
-             'any composition matching (graph_match.py; single resolution)'
+             'any composition matching (graph_match.py; single resolution); '
+             'loops = unsupervised embedding from contacts at given loops only, with a shifted-loop '
+             'control (loop_features.py; needs --loop_baseline_loops)'
     )
+    glue_parser.add_argument('--loop_baseline_loops', type=str, default=None,
+                             help='loops of the loops baseline: TSV with chrom, pos1, pos2 in the coordinates '
+                                  'of --scgad_scool (or --scool)')
+    glue_parser.add_argument('--loop_baseline_res', type=int, default=100_000,
+                             help='pixel resolution of the loops baseline (contacts are read from the '
+                                  'high-resolution scool and binned to loop pixels of this size)')
+    glue_parser.add_argument('--loop_baseline_norm', choices=['lsi', 'depth', 'oe', 'ice', 'ice_oe'],
+                             default='lsi', help='feature values of the loops baseline (lsi: Tian et al. 2023)')
     glue_parser.add_argument('--graph_match_resolution', type=lambda v: v if v == 'auto' else float(v),
                              default='auto',
                              help='Leiden resolution of the Hi-C only clusters of graph_match (the baseline '
@@ -460,7 +475,7 @@ if __name__ == '__main__':
     hic_type = 'raw'
     if args.use_ice:
         hic_type = 'ice'
-    loop_q = args.loop_q
+    loop_q = str(float(args.loop_q))  # as preprocessing writes it (0.90 -> 0.9)
     use_trans = args.use_trans
     depth_correction = not args.no_depth_correction
     hic_weight = args.hic_weight
@@ -928,6 +943,7 @@ if __name__ == '__main__':
                         "lam_graph": lam_graph,
                         "lam_cycle": lam_cycle,
                         "lam_downsample": args.lam_downsample,
+                        "lam_depth": args.lam_depth,
                         "downsample_min": args.downsample_min,
                         "downsample_max": args.downsample_max,
                         "normalize_u": normalize_u,
@@ -1038,23 +1054,26 @@ if __name__ == '__main__':
                        'filter_strata': filter_strata, 'loop_q': loop_q}
             )
 
-        if 'scgad' in args.baselines:
-            # same cells and metrics as above (scgad.py); a failure here should not
-            # lose the outputs of a finished training run
+        for base, method in (('scgad', 'harmony'), ('scgad_cca', 'cca')):
+            if base not in args.baselines:
+                continue
+            # same cells and metrics as above (scgad.py; scgad_cca: Seurat CCA as scGAD's runProjection);
+            # a failure here should not lose the outputs of a finished training run
             try:
                 import scgad
-                scgad_dir = os.path.join(eval_dir, "baselines", "scgad")
+                scgad_dir = os.path.join(eval_dir, "baselines", base)
                 scgad.run_baseline(
                     rna, hic, args.scgad_scool or args.scool, scgad_dir,
                     label_key="celltype", dataset_name=dataset_name, n_neighbors=n_neighbors,
                     n_features=args.scgad_features, n_pcs=args.scgad_pcs, n_jobs=args.scgad_jobs,
-                    cache_dir=os.path.join(out_dir, "baselines"), seed=seed, log_wandb=use_wandb
+                    cache_dir=os.path.join(out_dir, "baselines"), seed=seed, log_wandb=use_wandb,
+                    method=method
                 )
-                print(f"Saved scGAD baseline to {scgad_dir}")
+                print(f"Saved {base} baseline to {scgad_dir}")
             except Exception as e:  # noqa: BLE001
                 import traceback
                 traceback.print_exc()
-                print(f"scGAD baseline failed: {e}")
+                print(f"{base} baseline failed: {e}")
 
         if 'graph_match' in args.baselines:
             # same cells and metrics as above (graph_match.py); reuses the clusters of
@@ -1077,6 +1096,26 @@ if __name__ == '__main__':
                 import traceback
                 traceback.print_exc()
                 print(f"Graph matching baseline failed: {e}")
+
+        if 'loops' in args.baselines:
+            # Hi-C only embedding from contacts at given loops (loop_features.py), scored on the
+            # labelled Hi-C cells like the scGAD alone_* metrics. A failure here should not lose a finished run
+            try:
+                import loop_features
+                if not args.loop_baseline_loops:
+                    raise ValueError("--baselines loops needs --loop_baseline_loops")
+                loops_dir = os.path.join(eval_dir, "baselines", "loops")
+                loop_features.run_baseline(
+                    hic, args.scgad_scool or args.scool, pd.read_csv(args.loop_baseline_loops, sep="\t"),
+                    loops_dir, label_key="celltype", res=args.loop_baseline_res, norm=args.loop_baseline_norm,
+                    n_neighbors=n_neighbors, n_jobs=args.scgad_jobs,
+                    cache_dir=os.path.join(out_dir, "baselines"), seed=seed, log_wandb=use_wandb
+                )
+                print(f"Saved loops baseline to {loops_dir}")
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                print(f"Loops baseline failed: {e}")
 
         if args.structure_eval:
             # chromatin structure of pseudobulk pools (structure_eval.py); a failure

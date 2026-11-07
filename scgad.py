@@ -1,6 +1,6 @@
 r"""
 scGAD baseline: gene associating domain scores of single-cell Hi-C, integrated
-with scRNA-seq by Harmony
+with scRNA-seq by Harmony or by Seurat CCA (scGAD's own runProjection; scgad_cca.R)
 
 A Python port of ``scGAD`` from BandNorm (Shen, Zheng & Keleş, Bioinformatics
 2022; https://github.com/keleslab/BandNorm, ``R/scGAD.R``). For every gene and
@@ -397,6 +397,59 @@ def integrate(
     return {"rna": corrected[:rna_x.shape[0]], "hic": corrected[rna_x.shape[0]:], "hic_alone": alone}
 
 
+#: R with Seurat (>= 4) for the CCA integration; SCGAD_RSCRIPT overrides
+RSCRIPT = os.environ.get("SCGAD_RSCRIPT", "/home/dmp131/anaconda3/envs/benchmark/bin/Rscript")
+#: where the CCA exchange files go (several GB for 50k-cell references; not /tmp, which is small here)
+SCRATCH = os.environ.get("SCGAD_SCRATCH", "/mnt/jinstore/JinLab04/dmp131/scratch/scgad_cca")
+
+
+def integrate_cca(
+        rna: ad.AnnData, counts: ad.AnnData, seed: int = 0, workdir: Optional[str] = None,
+        rscript: str = RSCRIPT, k_filter: int = 50, k_weight: int = 80, n_pcs: int = 15,
+        rna_mode: str = "zscore"
+) -> Dict[str, np.ndarray]:
+    r"""
+    Co-embed GAD scores with RNA by Seurat CCA anchor integration, as scGAD's own ``runProjection`` (BandNorm,
+    ``R/scGAD.R``; see ``scgad_cca.R``): the scHi-C to scRNA-seq integration the scGAD authors published
+
+    Returns ``rna`` and ``hic`` embeddings (PCs of the integrated assay)
+    """
+    import subprocess
+    import tempfile
+    import scipy.io
+    expr = rna.layers["counts"] if "counts" in rna.layers else rna.X
+    own = workdir is None
+    if own:
+        os.makedirs(SCRATCH, exist_ok=True)
+    wd = tempfile.mkdtemp(prefix="scgad_cca_", dir=SCRATCH) if own else workdir
+    os.makedirs(wd, exist_ok=True)
+    try:
+        return _run_cca(rna, counts, expr, wd, seed, rscript, k_filter, k_weight, n_pcs, rna_mode)
+    finally:
+        if own:
+            import shutil
+            shutil.rmtree(wd, ignore_errors=True)
+
+
+def _run_cca(rna, counts, expr, wd, seed, rscript, k_filter, k_weight, n_pcs, rna_mode):
+    import subprocess
+    import scipy.io
+    for name, x, genes, cells in (("rna", expr, rna.var_names, rna.obs_names),
+                                  ("gad", counts.X, counts.var_names, counts.obs_names)):
+        scipy.io.mmwrite(os.path.join(wd, f"{name}.mtx"), scipy.sparse.csr_matrix(x, dtype=np.float64).T.tocoo())
+        pd.Series(genes).to_csv(os.path.join(wd, f"{name}_genes.txt"), index=False, header=False)
+        pd.Series(cells).to_csv(os.path.join(wd, f"{name}_cells.txt"), index=False, header=False)
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scgad_cca.R")
+    subprocess.run([rscript, script, wd, str(seed), str(k_filter), str(k_weight), str(n_pcs),
+                    rna_mode], check=True, env={**os.environ, "TMPDIR": wd})
+    pcs = pd.read_csv(os.path.join(wd, "pca.csv"))
+    out = {}
+    for dom, names in (("rna", rna.obs_names), ("hic", counts.obs_names)):
+        p = pcs[pcs["domain"] == dom].drop_duplicates("cell").set_index("cell")
+        out[dom] = p.loc[list(names)].drop(columns="domain").to_numpy(dtype=np.float32)
+    return out
+
+
 #---------------------------------- Evaluation ---------------------------------
 
 def run_baseline(
@@ -404,7 +457,7 @@ def run_baseline(
         label_key: str = "celltype", dataset_name: Optional[str] = None,
         n_neighbors: int = 15, n_features: int = 2000, n_pcs: int = 30,
         n_jobs: int = 8, cache_dir: Optional[str] = None, seed: int = 0,
-        log_wandb: bool = False
+        log_wandb: bool = False, method: str = "harmony", counts: Optional[ad.AnnData] = None
 ) -> Dict[str, float]:
     r"""
     scGAD + Harmony label transfer, evaluated like HiGLUE
@@ -414,9 +467,17 @@ def run_baseline(
     backed Hi-C data are fine). Writes :func:`evals.evaluate` outputs to
     ``out_dir`` and adds ``alone_*`` metrics: Leiden clustering of the scGAD
     embedding without RNA.
+
+    ``method``: ``harmony`` (joint PCA + Harmony, the default) or ``cca`` (Seurat CCA anchor integration as in
+    scGAD's ``runProjection``; no ``alone_*`` metrics, they are the same as the Harmony run's). ``counts``: GAD counts
+    of the Hi-C cells, if already computed.
     """
-    counts = gad_counts(scool, hic.obs_names, rna.var, n_jobs=n_jobs, cache_dir=cache_dir)
-    emb = integrate(rna, counts, n_features=n_features, n_pcs=n_pcs, seed=seed)
+    if counts is None:
+        counts = gad_counts(scool, hic.obs_names, rna.var, n_jobs=n_jobs, cache_dir=cache_dir)
+    if method == "cca":
+        emb = integrate_cca(rna, counts, seed=seed)
+    else:
+        emb = integrate(rna, counts, n_features=n_features, n_pcs=n_pcs, seed=seed)
     rep = "X_scgad"
     modalities = {}
     for k, adata in (("rna", rna), ("hic", hic)):
@@ -427,6 +488,9 @@ def run_baseline(
                                 dataset_name=dataset_name, n_neighbors=n_neighbors, seed=seed)
 
     # scGAD alone (no RNA): how well the GAD scores separate the annotated types
+    if "hic_alone" not in emb:
+        pd.Series(metrics, name="value").to_csv(os.path.join(out_dir, "metrics.csv"), header=True)
+        return metrics
     alone = ad.AnnData(obs=hic.obs[[label_key]].astype(str).copy())
     alone.obsm["X_gad_pca"] = emb["hic_alone"]
     labeled = ~alone.obs[label_key].isin(evals.UNLABELED).to_numpy()

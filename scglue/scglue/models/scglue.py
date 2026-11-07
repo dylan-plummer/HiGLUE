@@ -265,7 +265,7 @@ class SCGLUETrainer(GLUETrainer):
             lam_graph: float = None, lam_align: float = None,
             lam_sup: float = None, lam_cycle: float = None, normalize_u: bool = None,
             lam_downsample: float = 0.0, downsample_min: float = 0.3,
-            downsample_max: float = 0.9,
+            downsample_max: float = 0.9, lam_depth: float = 0.05,
             modality_weight: Mapping[str, float] = None,
             optim: str = None, lr: float = None, **kwargs
     ) -> None:
@@ -282,6 +282,8 @@ class SCGLUETrainer(GLUETrainer):
         self.lam_cycle = lam_cycle
         self.normalize_u = normalize_u
         self.lam_downsample = lam_downsample or 0.0
+        # weight of the read-depth adversary (0 disables it; HiGLUE's default 0.05)
+        self.lam_depth = 0.05 if lam_depth is None else lam_depth
         self.downsample_min = downsample_min
         self.downsample_max = downsample_max
         if self.lam_downsample:
@@ -468,7 +470,7 @@ class SCGLUETrainer(GLUETrainer):
     def compute_losses(
             self, data: DataTensors, epoch: int, dsc_only: bool = False
     ) -> Mapping[str, torch.Tensor]:
-        lam_depth = 0.05
+        lam_depth = self.lam_depth
         net = self.net
         if self.net.use_node_attributes:
             x, xrep, xbch, xlbl, xdwt, xflag, eidx, ewt, esgn, eattr = data
@@ -773,7 +775,7 @@ class PairedSCGLUETrainer(SCGLUETrainer):
     def compute_losses(
             self, data: PairedDataTensors, epoch: int, dsc_only: bool = False
     ) -> Mapping[str, torch.Tensor]:
-        lam_depth = 0.05
+        lam_depth = self.lam_depth
         net = self.net
         x, xrep, xbch, xlbl, xdwt, xrds, xflag, pmsk, eidx, ewt, esgn = data
 

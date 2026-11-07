@@ -1113,8 +1113,9 @@ def preprocess_higlue(args, glue_args):
     overlap_graph = nx.DiGraph(overlap_graph)
     print('Overlap #edges:', overlap_graph.number_of_edges())
     if atac_file is not None:
+        # peaks are linked to genes over the same regions as the Hi-C anchors (--gene_edges), as in GLUE
         atac_overlap_graph = scglue.genomics.window_graph(
-            promoters, atac_peaks, 0,
+            linked, atac_peaks, 0,
             attr_fn=lambda l, r, d: {
                 "weight": 1.0,
                 "type": "overlap",
@@ -1214,6 +1215,10 @@ def preprocess_higlue(args, glue_args):
     bait_oe['peak2'] = bait_oe['peak2'].astype(str)
 
     bait_oe = bait_oe[['peak1', 'peak2', 'rank', 'dist']]
+    if getattr(args, 'no_contact_edges', False):
+        # ablation: no pseudobulk contact edges, only the adjacency of consecutive bins
+        print('--no_contact_edges: dropping', len(bait_oe), 'contact edges')
+        bait_oe = bait_oe.iloc[0:0]
     existing_hic_edges = set(zip(bait_oe['peak1'], bait_oe['peak2']))
     seq_loops = seq_loops.loc[
         [edge not in existing_hic_edges for edge in zip(seq_loops['peak1'], seq_loops['peak2'])]
@@ -1336,8 +1341,10 @@ def preprocess_higlue(args, glue_args):
 
     d_prior = dist_graph.copy()
 
-    # any genes which are connected to a highly variable peak are also highly variable
-    if atac_file is not None:
+    # Highly variable peaks / methylation features stay the ones selected per modality. (An earlier version added
+    # every gene reachable from a variable peak and vice versa, but reachable_vertices is a full transitive
+    # closure: through the Hi-C anchors it reached every gene and peak and marked them all highly variable.)
+    if False and atac_file is not None:
         rna_hvg_set = set(rna.var.query("highly_variable").index)
         print('Initial highly variable genes:', len(rna_hvg_set))
         atac_hvg_set = set(atac.var.query("highly_variable").index)
@@ -1351,7 +1358,7 @@ def preprocess_higlue(args, glue_args):
         atac.var["highly_variable"] = atac.var_names.isin(final_hv_peaks)
         print('Final highly variable genes after adding ATAC:', rna.var["highly_variable"].sum())
         print('Final highly variable ATAC peaks after adding genes:', atac.var["highly_variable"].sum())
-    if methyl_file is not None:
+    if False and methyl_file is not None:  # same transitive-closure problem as ATAC above
         rna_hvg_set = set(rna.var.query("highly_variable").index)
         methyl_hvg_set = set(methyl.var.query("highly_variable").index)
         reachable_from_hv_peaks = scglue.graph.reachable_vertices(methyl_o_prior, methyl_hvg_set)
@@ -1366,9 +1373,11 @@ def preprocess_higlue(args, glue_args):
         print('Final highly variable Methyl genes after adding genes:', methyl.var["highly_variable"].sum())
 
     if atac_file is not None:
-        atac_hvg_reachable = scglue.graph.reachable_vertices(atac_o_prior, atac.var.query("highly_variable").index)
-        atac_o_prior = atac_o_prior.subgraph(atac_hvg_reachable)
-        print(atac_o_prior)
+        # keep genes, anchors and the highly variable peaks
+        hv_peaks = set(atac.var_names[atac.var["highly_variable"]])
+        all_peaks = set(atac.var_names)
+        atac_o_prior = atac_o_prior.subgraph([n for n in atac_o_prior.nodes if n not in all_peaks or n in hv_peaks])
+        print('ATAC graph (highly variable peaks):', atac_o_prior)
     if methyl_file is not None:
         methyl_hvg_reachable = scglue.graph.reachable_vertices(methyl_o_prior, methyl.var.query("highly_variable").index)
         methyl_o_prior = methyl_o_prior.subgraph(methyl_hvg_reachable)
@@ -1405,9 +1414,9 @@ def preprocess_higlue(args, glue_args):
     hvg_reachable = scglue.graph.reachable_vertices(dcq_prior, rna.var.query("highly_variable").index)
     hic.var["dcq_highly_variable"] = [item in hvg_reachable for item in hic.var_names]
     if atac_file is not None:
-        atac_reachable = scglue.graph.reachable_vertices(dcq_prior, rna.var.query("highly_variable").index)
-        atac.var["highly_variable"] = [item in atac_reachable for item in atac.var_names]
-        print('ATAC variable Hi-C features', atac.var["highly_variable"].sum())
+        # highly variable peaks that made it into the graph (every peak overlaps an anchor; not a transitive closure)
+        atac.var["highly_variable"] = atac.var["highly_variable"] & atac.var_names.isin(list(dcq_prior.nodes))
+        print('ATAC highly variable peaks in the graph:', int(atac.var["highly_variable"].sum()))
     if methyl_file is not None:
         methyl_reachable = scglue.graph.reachable_vertices(dcq_prior, rna.var.query("highly_variable").index)
         methyl.var["highly_variable"] = [item in methyl_reachable for item in methyl.var_names]
