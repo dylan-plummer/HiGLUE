@@ -225,10 +225,16 @@ def _name_clusters(clusters: pd.Series, emb: np.ndarray, x: sp.csr_matrix, var_n
 def match(
         rna: ad.AnnData, hic: ad.AnnData, graph: nx.Graph, label_key: str = "celltype",
         label_map: Optional[Mapping[str, str]] = None, resolution: Union[float, str] = "auto",
-        min_cluster: int = 20, min_ref_cells: int = 30, batch_key: Optional[str] = "batch", seed: int = 0
+        min_cluster: int = 20, min_ref_cells: int = 30, batch_key: Optional[str] = "batch", seed: int = 0,
+        embedding: Optional[np.ndarray] = None
 ) -> Dict[str, object]:
     r"""
     Cluster the Hi-C cells and name every cluster through the graph
+
+    ``embedding`` (cells x dims, in the order of ``hic``) replaces the Hi-C only
+    PCs that are clustered (e.g. a Fast-Higashi embedding,
+    ``fasthigashi_baseline.py``); the clusters are still named from the band
+    features of ``hic``.
 
     ``resolution="auto"`` clusters at every resolution of :data:`AUTO_RESOLUTIONS`
     and keeps the one whose clusters match their types best (size-weighted mean
@@ -243,7 +249,7 @@ def match(
     (per resolution scanned: clusters and mean z).
     """
     x = hic_counts(hic)
-    emb = hic_embedding(hic, x, batch_key=batch_key, seed=seed)
+    emb = hic_embedding(hic, x, batch_key=batch_key, seed=seed) if embedding is None else np.asarray(embedding)
     a = ad.AnnData(obs=pd.DataFrame(index=hic.obs_names.astype(str)), obsm={"X": emb})
     sc.pp.neighbors(a, use_rep="X", n_neighbors=15, random_state=seed)
     rna_labels = evals.harmonize(rna.obs[label_key], label_map)
@@ -293,8 +299,34 @@ def estimate_composition(result: Dict[str, object], temperature: float = 0.0) ->
     return result["pred"].astype(str).value_counts(normalize=True)
 
 
+def cap_composition(hic_composition: pd.Series, reference: pd.Series, max_ratio: float) -> pd.Series:
+    r"""
+    Caps every type of a composition estimate at ``max_ratio`` times its reference share and spreads the excess
+    over the other types in proportion to their estimates (repeated until no type exceeds its cap)
+
+    A Hi-C only cluster that merges cells of several types (e.g. shallow cells, whose clusters follow depth) is
+    named by whichever type matches it best, often a rare one with a noisy signature; without the cap that rare
+    type gets the cluster's whole share (in-house islets at 10,000 contacts: Gamma 43% vs 1% of the reference)
+    """
+    p = hic_composition.reindex(reference.index, fill_value=0).astype(float)
+    p = p / max(p.sum(), 1e-12)
+    cap = max_ratio * reference.reindex(p.index).fillna(0)
+    for _ in range(len(p)):
+        over = p > cap + 1e-12
+        if not over.any():
+            break
+        excess = float((p[over] - cap[over]).sum())
+        p[over] = cap[over]
+        free = ~over & (p < cap)
+        if p[free].sum() <= 0:
+            break
+        p[free] += excess * p[free] / p[free].sum()
+    return p
+
+
 def composition_weights(
-        rna_labels: pd.Series, hic_composition: pd.Series, floor: float = 0.1, max_weight: float = 20.0
+        rna_labels: pd.Series, hic_composition: pd.Series, floor: float = 0.1, max_weight: float = 20.0,
+        max_ratio: Optional[float] = None
 ) -> Tuple[np.ndarray, pd.DataFrame]:
     r"""
     Per RNA cell weight that gives the reference the estimated Hi-C composition
@@ -303,15 +335,19 @@ def composition_weights(
     The target proportion of every reference type is ``(1 - floor) * estimate +
     floor * reference``, so types the estimate misses keep ``floor`` of their
     weight. Weights are capped at ``max_weight`` (before the discriminator
-    rescales them to mean 1).
+    rescales them to mean 1). ``max_ratio`` first caps the estimate of every
+    type at that multiple of its reference share (:func:`cap_composition`).
     """
     rna_labels = rna_labels.astype(str)
     p_rna = rna_labels.value_counts(normalize=True)
     p_hic = hic_composition.reindex(p_rna.index, fill_value=0)
     p_hic = p_hic / max(p_hic.sum(), 1e-12)
+    raw = p_hic.copy()
+    if max_ratio:
+        p_hic = cap_composition(p_hic, p_rna, max_ratio)
     target = (1 - floor) * p_hic + floor * p_rna
     w_type = (target / p_rna).clip(upper=max_weight)
-    table = pd.DataFrame({"reference": p_rna, "hic_estimate": p_hic, "target": target,
+    table = pd.DataFrame({"reference": p_rna, "hic_estimate_raw": raw, "hic_estimate": p_hic, "target": target,
                           "weight": w_type,
                           "weighted_reference": p_rna * w_type / (p_rna * w_type).sum()})
     return rna_labels.map(w_type).to_numpy(dtype=float), table.sort_values("hic_estimate", ascending=False)

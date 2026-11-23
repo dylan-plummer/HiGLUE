@@ -320,23 +320,9 @@ def load_methyl_modality(methyl_file, rna, gtf_file, n_genes, plot_dir):
     methyl.layers["counts"] = methyl.X.copy()
     methyl.var['name'] = methyl.var_names
     methyl.var['name'] = methyl.var['name'].apply(lambda s: s.replace('_mCH', '').replace('_mCG', ''))
-    keep_columns = scglue.genomics.Bed.COLUMNS
-    for col in keep_columns:
-        try:
-            rna.var.drop(columns=[col], inplace=True)
-        except Exception as e:
-            print(e)
-            pass
-    try:
-        scglue.data.get_gene_annotation(
-            rna, gtf=gtf_file,
-            gtf_by="gene_name"
-        )
-    except KeyError:
-        scglue.data.get_gene_annotation(
-            rna, gtf=gtf_file,
-            gtf_by="gene_symbol"
-        )
+    # the RNA genes are already annotated (and cleaned: 'chr' names, unannotated genes dropped) by the RNA loader;
+    # only their names are used here. Re-annotating rna from the raw GTF in place, as before, undid that cleaning for
+    # every later step (with an Ensembl-style GTF: chromosomes without 'chr' and genes without coordinates)
     methyl.var['chromStart'] = methyl.var['chromStart'].fillna(0).astype(int)
     methyl.var['chromEnd'] = methyl.var['chromEnd'].fillna(0).astype(int)
     methyl.var['strand'] = methyl.var['strand'].fillna('+')
@@ -811,11 +797,15 @@ def preprocess_higlue(args, glue_args):
         except Exception as e:
             print('Could not find bulk cooler file, generating from psuedobulk...')
             set_verbosity_level(1)
-            cooler.merge_coolers(out_cool_file, cool_files, mergebuf=40000000)
-            bulk = cooler.Cooler(out_cool_file)
+            # written to a file of this process and renamed into place: preprocessing jobs of other
+            # configurations of the same cells (run in parallel) share this cache and must never read or
+            # write a partial cooler; two writers produce the same file and the last rename wins
+            tmp_cool_file = f"{out_cool_file}.tmp{os.getpid()}"
+            cooler.merge_coolers(tmp_cool_file, cool_files, mergebuf=40000000)
             if use_ice:
-                cooler.balance_cooler(bulk, cis_only=False, store=True)
-                bulk = cooler.Cooler(out_cool_file)
+                cooler.balance_cooler(cooler.Cooler(tmp_cool_file), cis_only=False, store=True)
+            os.replace(tmp_cool_file, out_cool_file)
+            bulk = cooler.Cooler(out_cool_file)
     # plot example heatmap
     mat = bulk.matrix(balance=use_ice).fetch('chr10')
     midpoint = mat.shape[0] // 2

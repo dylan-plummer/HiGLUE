@@ -250,6 +250,20 @@ if __name__ == '__main__':
     glue_parser.add_argument('--comp_weight_floor', type=float, default=0.1,
                              help='share of a reference type\'s weight kept when the estimate '
                                   'does not find it in the Hi-C cells')
+    glue_parser.add_argument('--comp_weight_min_depth', type=float, default=0,
+                             help='estimate the Hi-C composition (--comp_weight graph) from the cells with at '
+                                  'least this many contacts only (0: all cells). Shallow cells cluster by depth, '
+                                  'and their cluster takes one name (in-house islets at a 10,000 cutoff: 43%% '
+                                  '"Gamma")')
+    glue_parser.add_argument('--comp_weight_max_ratio', type=float, default=0,
+                             help='cap the composition estimate of every type at this multiple of its reference '
+                                  'share, the excess spread over the other types (0: no cap; '
+                                  'graph_match.cap_composition)')
+    glue_parser.add_argument('--methyl_comp_weight', action='store_true',
+                             help='with --comp_weight graph and --methyl_file: weight the methylation cells in the '
+                                  'discriminator too, by their own cell type labels, toward the same estimated '
+                                  'Hi-C composition (for methylation from another dataset with a different '
+                                  'composition, e.g. the atlas methylation with in-house Hi-C)')
     glue_parser.add_argument('--normalize_u', action='store_true')
     glue_parser.add_argument('--binarize', action='store_true')
     glue_parser.add_argument('--use_batch', type=str, default=None)
@@ -620,6 +634,8 @@ if __name__ == '__main__':
 
         celltypes = list(hic.obs['celltype'].unique())
         if 'pfc' in dataset_name:
+            # pfc_full: all 14 snm3C-seq cell types (datasets/pfc_full); pfc: the neurons only
+            pfc_full = 'pfc_full' in dataset_name
             neurons_rna_celltypes = ['IN-PV', 'IN-SST', 'IN-VIP', 'IN-SV2C', 'Neu-mat',
                       'L2/3', 'L4', 'L5', 'L5/6', 'L6', 'L5/6-CC']
             neurons_hic_celltypes = ['L2/3', 'L4', 'L5', 'L6', 'Ndnf', 'Pvalb', 'Sst', 'Vip']  
@@ -642,11 +658,13 @@ if __name__ == '__main__':
                                 'Neu-NRGN-II': 'Neu',
                                 'Neu-mat': 'Neu',
                                 'OPC': 'OPC',
-                                'Oligodendrocyte': 'ODC'}
+                                'Oligodendrocyte': 'ODC',
+                                'Oligodendrocytes': 'ODC'}  # the label in brain_autism.h5ad
             rna = rna[rna.obs['region'] == 'PFC', :]
             rna = rna[~rna.obs['celltype'].isin(['Neu-NRGN-I', 'Neu-NRGN-II', 'Neu-mat'])]
             #rna = rna[~rna.obs['celltype'].isin(['Neu-NRGN-I', 'Neu-NRGN-II'])]
-            rna = rna[rna.obs['celltype'].isin(neurons_rna_celltypes)]
+            if not pfc_full:
+                rna = rna[rna.obs['celltype'].isin(neurons_rna_celltypes)]
             rna.obs['celltype'] = rna.obs['celltype'].map(rna_celltype_map)
         elif 'human_brain' in dataset_name:
             neurons_rna_celltypes = ['IN-PV', 'IN-SST', 'IN-VIP', 'IN-SV2C', 'Neu-mat',
@@ -856,18 +874,40 @@ if __name__ == '__main__':
             # Hi-C composition estimated without the adversary (graph_match.py),
             # given to the reference through the discriminator weights of its cells
             import graph_match
+            hic_cw = hic
+            if args.comp_weight_min_depth > 0:
+                depth_cw = hic.obs["read_depth" if "read_depth" in hic.obs else "depth"].astype(float)
+                hic_cw = hic[(depth_cw >= args.comp_weight_min_depth).to_numpy()].copy()
+                print(f"Composition estimate from the {hic_cw.n_obs} of {hic.n_obs} Hi-C cells with >= "
+                      f"{args.comp_weight_min_depth:.0f} contacts")
             graph_match_result = graph_match.match(
-                rna, hic, prior, "celltype",
+                rna, hic_cw, prior, "celltype",
                 evals.get_label_map(dataset_name, hic.obs['celltype'], rna.obs['celltype']),
                 resolution=args.graph_match_resolution, seed=seed
             )
+            hic_estimate = graph_match.estimate_composition(graph_match_result, args.comp_weight_temperature)
             weights, weight_table = graph_match.composition_weights(
-                graph_match_result["rna_labels"],
-                graph_match.estimate_composition(graph_match_result, args.comp_weight_temperature),
-                floor=args.comp_weight_floor
+                graph_match_result["rna_labels"], hic_estimate,
+                floor=args.comp_weight_floor, max_ratio=args.comp_weight_max_ratio or None
             )
             rna.obs["comp_weight"] = weights
             rna.uns[scglue.config.ANNDATA_KEY]["use_dsc_weight"] = "comp_weight"
+            if args.methyl_comp_weight and methyl_file is not None:
+                # the methylation cells toward the same target composition, by their own labels (types the
+                # target lacks keep --comp_weight_floor of their weight, as in the reference)
+                m_labels = evals.harmonize(methyl.obs["celltype"].astype(str),
+                                           evals.get_label_map(dataset_name, methyl.obs["celltype"],
+                                                               rna.obs["celltype"]))
+                m_target = weight_table["hic_estimate"]
+                m_weights, m_table = graph_match.composition_weights(
+                    pd.Series(np.asarray(m_labels), index=methyl.obs_names), m_target,
+                    floor=args.comp_weight_floor)
+                methyl.obs["comp_weight"] = m_weights
+                methyl.uns[scglue.config.ANNDATA_KEY]["use_dsc_weight"] = "comp_weight"
+                os.makedirs(os.path.join(eval_dir, "comp_weight"), exist_ok=True)
+                m_table.round(4).to_csv(os.path.join(eval_dir, "comp_weight", "methyl_composition_weights.csv"))
+                print("Discriminator weights of the methylation cells (--methyl_comp_weight):\n"
+                      + m_table.round(3).to_string())
             weight_dir = os.path.join(eval_dir, "comp_weight")
             os.makedirs(weight_dir, exist_ok=True)
             weight_table.round(4).to_csv(os.path.join(weight_dir, "composition_weights.csv"))
@@ -1088,7 +1128,9 @@ if __name__ == '__main__':
                 graph_match.run_baseline(
                     rna, hic, prior, graph_match_dir, label_key="celltype", dataset_name=dataset_name,
                     n_neighbors=n_neighbors, resolution=args.graph_match_resolution, seed=seed,
-                    result=graph_match_result, compare={"HiGLUE": hic_pred.value_counts(normalize=True)},
+                    # the clusters of --comp_weight graph are reused only if they cover every Hi-C cell
+                    result=graph_match_result if not args.comp_weight_min_depth else None,
+                    compare={"HiGLUE": hic_pred.value_counts(normalize=True)},
                     log_wandb=use_wandb
                 )
                 print(f"Saved graph matching baseline to {graph_match_dir}")
